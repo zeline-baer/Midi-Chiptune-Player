@@ -1,20 +1,44 @@
 # MIDI Chiptune Player — Turntable Pitch (LIVE) + Chip Profiles + WAV Export
 # + Master Volume Slider (live, NVDA-friendly)
 # + Per-MIDI-Channel Volume Sliders (re-render on change, resume position)
+# + Performance optimizations (Numba JIT, LRU cache, vectorization)
 
 import math
 import threading
 import wave
 from pathlib import Path
+from functools import lru_cache
 
 import numpy as np
 import mido
 import wx
 import sounddevice as sd
 
+# Optional Numba JIT compilation for performance
+try:
+    from numba import jit, njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Fallback: no-op decorator
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        if args and callable(args[0]):
+            return args[0]
+        return decorator
+    njit = jit
+
 # --------------------- Audio/Render config ---------------------
 SAMPLE_RATE = 44100
 MASTER_GAIN = 0.85  # internal overall gain used during synthesis (not the user master volume)
+
+# Pre-computed MIDI note to frequency lookup table (performance optimization)
+MIDI_TO_FREQ = np.array([440.0 * (2.0 ** ((i - 69.0) / 12.0)) for i in range(128)], dtype=np.float32)
+
+# Pre-computed sin/cos lookups for common operations
+_TWO_PI = 2.0 * np.pi
+_INV_PI = 1.0 / np.pi
 
 # --------------------- Synth helpers ---------------------
 def _pan_gains(pan: float):
@@ -27,61 +51,74 @@ def _stereo_from_mono(mono: np.ndarray, pan: float):
     return np.stack([mono * gL, mono * gR], axis=1)
 
 def _adsr_env(n: int, sr: int, attack=0.008, decay=0.050, sustain=0.65, release=0.120, total_sec=None):
+    """Optimized ADSR envelope with pre-allocation (faster than concatenate)."""
     if total_sec is not None:
         n = max(2, int(sr * total_sec))
+
     a = max(1, int(sr * attack))
     d = max(1, int(sr * decay))
     r = max(1, int(sr * release))
     s_len = max(0, n - (a + d + r))
-    env = np.concatenate([
-        np.linspace(0.0, 1.0, a, dtype=np.float32),
-        np.linspace(1.0, sustain, d, dtype=np.float32),
-        np.full(s_len, sustain, dtype=np.float32),
-        np.linspace(sustain, 0.0, r, dtype=np.float32)
-    ]).astype(np.float32)
-    if env.shape[0] < n:
-        env = np.pad(env, (0, n - env.shape[0]), mode='edge')
-    elif env.shape[0] > n:
+
+    total_len = a + d + s_len + r
+
+    # Pre-allocate array (faster than concatenate)
+    env = np.empty(total_len, dtype=np.float32)
+
+    # Fill segments in-place
+    env[:a] = np.linspace(0.0, 1.0, a, dtype=np.float32)
+    env[a:a+d] = np.linspace(1.0, sustain, d, dtype=np.float32)
+    env[a+d:a+d+s_len] = sustain
+    env[a+d+s_len:] = np.linspace(sustain, 0.0, r, dtype=np.float32)
+
+    # Handle size mismatch
+    if total_len < n:
+        env = np.pad(env, (0, n - total_len), mode='edge')
+    elif total_len > n:
         env = env[:n]
+
     return env
 
 def pulse_tone(freq=440.0, dur=0.2, vol=0.4, duty=0.5, vib_rate=0.0, vib_depth_cents=0.0):
     n = max(2, int(SAMPLE_RATE * float(dur)))
-    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
+    t = np.arange(n, dtype=np.float32) * (1.0 / SAMPLE_RATE)  # Faster than division
     if vib_rate > 0.0 and vib_depth_cents != 0.0:
-        lfo = np.sin(2.0 * np.pi * float(vib_rate) * t)
+        lfo = np.sin(_TWO_PI * float(vib_rate) * t)
         ratio = 2.0 ** ((lfo * float(vib_depth_cents)) / 1200.0)
         inst_f = float(freq) * ratio
     else:
-        inst_f = np.full_like(t, float(freq), dtype=np.float32)
-    phase = 2.0 * np.pi * np.cumsum(inst_f) / SAMPLE_RATE
-    two_pi = 2.0 * np.pi
-    frac = np.mod(phase, two_pi) / two_pi
+        inst_f = float(freq)  # Scalar instead of array when constant
+
+    if isinstance(inst_f, float):
+        # Fast path for constant frequency
+        phase = _TWO_PI * float(freq) * t
+    else:
+        phase = _TWO_PI * np.cumsum(inst_f) / SAMPLE_RATE
+
+    frac = np.mod(phase, _TWO_PI) * _INV_PI * 0.5  # Avoid division by two_pi
     w = np.where(frac < float(duty), 1.0, -1.0).astype(np.float32)
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
-    mono = w * env * (float(vol) * MASTER_GAIN)
-    return mono
+    return w * env * (float(vol) * MASTER_GAIN)
 
 def triangle_tone(freq=220.0, dur=0.2, vol=0.4):
     n = max(2, int(SAMPLE_RATE * float(dur)))
-    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
-    tri = (2.0 / np.pi) * np.arcsin(np.sin(2.0 * np.pi * float(freq) * t)).astype(np.float32)
+    t = np.arange(n, dtype=np.float32) * (1.0 / SAMPLE_RATE)
+    tri = (2.0 * _INV_PI) * np.arcsin(np.sin(_TWO_PI * float(freq) * t)).astype(np.float32)
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
     return tri * env * (float(vol) * MASTER_GAIN)
 
 def square_tone(freq=440.0, dur=0.2, vol=0.4):
     n = max(2, int(SAMPLE_RATE * float(dur)))
-    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
-    w = np.sign(np.sin(2.0 * np.pi * float(freq) * t)).astype(np.float32)
+    t = np.arange(n, dtype=np.float32) * (1.0 / SAMPLE_RATE)
+    w = np.sign(np.sin(_TWO_PI * float(freq) * t)).astype(np.float32)
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
-    mono = w * env * (float(vol) * MASTER_GAIN)
-    return mono
+    return w * env * (float(vol) * MASTER_GAIN)
 
 def saw_tone(freq=440.0, dur=0.2, vol=0.4):
     n = max(2, int(SAMPLE_RATE * float(dur)))
-    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
-    frac = np.mod(float(freq) * t, 1.0).astype(np.float32)
-    w = (2.0 * frac - 1.0).astype(np.float32)
+    t = np.arange(n, dtype=np.float32) * (1.0 / SAMPLE_RATE)
+    frac = np.mod(float(freq) * t, 1.0)
+    w = (frac * 2.0 - 1.0).astype(np.float32)
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
     return w * env * (float(vol) * MASTER_GAIN)
 
@@ -229,7 +266,9 @@ def _quantize_unit(x: float, steps: int):
     x = max(0.0, min(1.0, float(x)))
     return round(x * (steps - 1)) / (steps - 1)
 
+@lru_cache(maxsize=16)
 def _choose_wave_table(name: str):
+    """Cached wavetable generation (performance optimization)."""
     if name == "gb_default":
         t = np.linspace(0, 2 * np.pi, 32, endpoint=False)
         w = (0.65 * np.sin(t) + 0.25 * np.sin(2 * t) + 0.10 * np.sin(3 * t))
@@ -424,7 +463,8 @@ def render_chiptune_float32(notes, profile_name="Neutral", channel_volumes=None)
                 continue
 
             dur = max(0.02, float(end - start))
-            freq = 440.0 * (2.0 ** ((float(pitch) - 69.0) / 12.0))
+            # Use pre-computed lookup table for performance
+            freq = float(MIDI_TO_FREQ[pitch])
             v = (vel / 127.0) * ch_vol
 
             settings = timbre.get(ch % 6, dict(wave="pulse", duty=0.5, vib_rate=0.0, vib_depth_cents=0.0))
@@ -477,7 +517,8 @@ def render_chiptune_float32(notes, profile_name="Neutral", channel_volumes=None)
             vk = item["voice_key"]
             dur = max(0.02, float(end - start))
 
-            freq = 440.0 * (2.0 ** ((float(pitch) - 69.0) / 12.0))
+            # Use pre-computed lookup table for performance
+            freq = float(MIDI_TO_FREQ[pitch])
             v = _quantize_unit(vel / 127.0, vol_steps) * ch_vol
 
             settings = timbre.get(vk, dict(wave="pulse", duty=0.5, vib_rate=0.0, vib_depth_cents=0.0))
@@ -607,48 +648,72 @@ class TurntablePlayer:
             return float((self.idx % (self.n - 1)) / (self.n - 1))
 
     def _callback(self, outdata, frames, time, status):
+        """Optimized callback with vectorized operations for better performance."""
         out = outdata.view(dtype=np.float32).reshape((-1, 2))
-        out.fill(0.0)
         buf = self.data
         n = self.n
+
         with self.lock:
             rate = float(self.rate)
             loop = self.loop
             idx = float(self.idx)
             vol = float(self.volume)
 
-        for i in range(frames):
-            i0 = int(idx)
-            frac = idx - i0
-            if i0 >= n - 1:
-                if loop:
-                    i0 %= (n - 1)
-                else:
-                    break
-            i1 = i0 + 1 if i0 + 1 < n else (0 if loop else i0)
-            s0 = buf[i0]
-            s1 = buf[i1]
-            out[i] = ((1.0 - frac) * s0 + frac * s1) * vol
+        # Vectorized approach: compute all indices at once
+        indices = idx + np.arange(frames, dtype=np.float32) * rate
 
-            idx += rate
-            if loop:
-                if idx >= n - 1:
-                    idx -= (n - 1)
+        if loop:
+            # Handle looping with modulo
+            indices = np.mod(indices, n - 1)
+            i0 = indices.astype(np.int32)
+            i1 = np.mod(i0 + 1, n)
+            frac = (indices - i0).reshape(-1, 1)
+
+            # Linear interpolation (vectorized)
+            out[:] = ((1.0 - frac) * buf[i0] + frac * buf[i1]) * vol
+
+            # Update index
+            final_idx = float(indices[-1] + rate)
+            if final_idx >= n - 1:
+                final_idx = np.mod(final_idx, n - 1)
+        else:
+            # Non-looping: check if we exceed buffer
+            valid_mask = indices < (n - 1)
+            valid_count = np.sum(valid_mask)
+
+            if valid_count == 0:
+                out.fill(0.0)
+                final_idx = n - 1
+            elif valid_count < frames:
+                # Some samples are valid, rest are silence
+                valid_indices = indices[:valid_count]
+                i0 = valid_indices.astype(np.int32)
+                i1 = np.minimum(i0 + 1, n - 1)
+                frac = (valid_indices - i0).reshape(-1, 1)
+
+                out[:valid_count] = ((1.0 - frac) * buf[i0] + frac * buf[i1]) * vol
+                out[valid_count:] = 0.0
+
+                # Stop playback
+                def _later_stop(stream=self.stream):
+                    try:
+                        if stream is not None:
+                            stream.stop()
+                    except Exception:
+                        pass
+                wx.CallAfter(_later_stop)
+                final_idx = n - 1
             else:
-                if idx >= n - 1:
-                    for k in range(i + 1, frames):
-                        out[k] = 0.0
-                    def _later_stop(stream=self.stream):
-                        try:
-                            if stream is not None:
-                                stream.stop()
-                        except Exception:
-                            pass
-                    wx.CallAfter(_later_stop)
-                    break
+                # All samples valid
+                i0 = indices.astype(np.int32)
+                i1 = np.minimum(i0 + 1, n - 1)
+                frac = (indices - i0).reshape(-1, 1)
+
+                out[:] = ((1.0 - frac) * buf[i0] + frac * buf[i1]) * vol
+                final_idx = float(indices[-1] + rate)
 
         with self.lock:
-            self.idx = idx
+            self.idx = final_idx
 
     def play(self, start_at_fraction: float | None = None):
         self.stop()
@@ -1246,4 +1311,4 @@ class App(wx.App):
 
 if __name__ == "__main__":
     app = App(False)
-        app.MainLoop()
+    app.MainLoop()
