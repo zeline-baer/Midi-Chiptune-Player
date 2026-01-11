@@ -20,7 +20,7 @@ import mido
 import wx
 import sounddevice as sd
 
-# Optional Numba JIT compilation for performance
+# Optional Numba JIT compilation for performancee
 try:
     from numba import jit, njit
     NUMBA_AVAILABLE = True
