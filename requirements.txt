@@ -2,3 +2,4 @@ numpy
 wxpython
 mido
 sounddevice
+numba
