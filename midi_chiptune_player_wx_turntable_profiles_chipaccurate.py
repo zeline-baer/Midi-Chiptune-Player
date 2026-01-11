@@ -1,11 +1,17 @@
-# MIDI Chiptune Player — Turntable Pitch (LIVE) + Chip Profiles + WAV Export
+# MIDI Chiptune Player — Turntable Pitch (LIVE) + Chip Profiles + WAV/MP3 Export
 # + Master Volume Slider (live, NVDA-friendly)
-# + Per-MIDI-Channel Volume Sliders (re-render on change, resume position)
-# + Performance optimizations (Numba JIT, LRU cache, vectorization)
+# + Per-used-MIDI-Channel Volume Sliders (auto re-render on change, resume position)
+# + Seek (scrub) slider + elapsed/total time (NVDA-friendly)
+# + MP3 export via FFmpeg if installed (otherwise shows install hint)
+# + Space key is NOT hijacked globally (works normally on focused controls)
 
 import math
 import threading
 import wave
+import time
+import tempfile
+import subprocess
+import shutil
 from pathlib import Path
 from functools import lru_cache
 
@@ -20,6 +26,7 @@ try:
     NUMBA_AVAILABLE = True
 except ImportError:
     NUMBA_AVAILABLE = False
+
     # Fallback: no-op decorator
     def jit(*args, **kwargs):
         def decorator(func):
@@ -27,6 +34,7 @@ except ImportError:
         if args and callable(args[0]):
             return args[0]
         return decorator
+
     njit = jit
 
 # --------------------- Audio/Render config ---------------------
@@ -40,15 +48,31 @@ MIDI_TO_FREQ = np.array([440.0 * (2.0 ** ((i - 69.0) / 12.0)) for i in range(128
 _TWO_PI = 2.0 * np.pi
 _INV_PI = 1.0 / np.pi
 
+
+# --------------------- Accessibility helpers ---------------------
+def _a11y(win: wx.Window, name: str, help_text: str | None = None):
+    """Set NVDA-friendly label/name/helptext on controls."""
+    try:
+        win.SetName(name)
+    except Exception:
+        pass
+    try:
+        win.SetHelpText(help_text or name)
+    except Exception:
+        pass
+
+
 # --------------------- Synth helpers ---------------------
 def _pan_gains(pan: float):
     p = max(-1.0, min(1.0, float(pan)))
     angle = (p + 1.0) * math.pi / 4.0  # equal-power
     return math.cos(angle), math.sin(angle)
 
+
 def _stereo_from_mono(mono: np.ndarray, pan: float):
     gL, gR = _pan_gains(pan)
     return np.stack([mono * gL, mono * gR], axis=1)
+
 
 def _adsr_env(n: int, sr: int, attack=0.008, decay=0.050, sustain=0.65, release=0.120, total_sec=None):
     """Optimized ADSR envelope with pre-allocation (faster than concatenate)."""
@@ -62,16 +86,12 @@ def _adsr_env(n: int, sr: int, attack=0.008, decay=0.050, sustain=0.65, release=
 
     total_len = a + d + s_len + r
 
-    # Pre-allocate array (faster than concatenate)
     env = np.empty(total_len, dtype=np.float32)
-
-    # Fill segments in-place
     env[:a] = np.linspace(0.0, 1.0, a, dtype=np.float32)
-    env[a:a+d] = np.linspace(1.0, sustain, d, dtype=np.float32)
-    env[a+d:a+d+s_len] = sustain
-    env[a+d+s_len:] = np.linspace(sustain, 0.0, r, dtype=np.float32)
+    env[a:a + d] = np.linspace(1.0, sustain, d, dtype=np.float32)
+    env[a + d:a + d + s_len] = sustain
+    env[a + d + s_len:] = np.linspace(sustain, 0.0, r, dtype=np.float32)
 
-    # Handle size mismatch
     if total_len < n:
         env = np.pad(env, (0, n - total_len), mode='edge')
     elif total_len > n:
@@ -79,26 +99,27 @@ def _adsr_env(n: int, sr: int, attack=0.008, decay=0.050, sustain=0.65, release=
 
     return env
 
+
 def pulse_tone(freq=440.0, dur=0.2, vol=0.4, duty=0.5, vib_rate=0.0, vib_depth_cents=0.0):
     n = max(2, int(SAMPLE_RATE * float(dur)))
-    t = np.arange(n, dtype=np.float32) * (1.0 / SAMPLE_RATE)  # Faster than division
+    t = np.arange(n, dtype=np.float32) * (1.0 / SAMPLE_RATE)
     if vib_rate > 0.0 and vib_depth_cents != 0.0:
         lfo = np.sin(_TWO_PI * float(vib_rate) * t)
         ratio = 2.0 ** ((lfo * float(vib_depth_cents)) / 1200.0)
         inst_f = float(freq) * ratio
     else:
-        inst_f = float(freq)  # Scalar instead of array when constant
+        inst_f = float(freq)
 
     if isinstance(inst_f, float):
-        # Fast path for constant frequency
         phase = _TWO_PI * float(freq) * t
     else:
         phase = _TWO_PI * np.cumsum(inst_f) / SAMPLE_RATE
 
-    frac = np.mod(phase, _TWO_PI) * _INV_PI * 0.5  # Avoid division by two_pi
+    frac = np.mod(phase, _TWO_PI) * _INV_PI * 0.5
     w = np.where(frac < float(duty), 1.0, -1.0).astype(np.float32)
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
     return w * env * (float(vol) * MASTER_GAIN)
+
 
 def triangle_tone(freq=220.0, dur=0.2, vol=0.4):
     n = max(2, int(SAMPLE_RATE * float(dur)))
@@ -107,12 +128,14 @@ def triangle_tone(freq=220.0, dur=0.2, vol=0.4):
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
     return tri * env * (float(vol) * MASTER_GAIN)
 
+
 def square_tone(freq=440.0, dur=0.2, vol=0.4):
     n = max(2, int(SAMPLE_RATE * float(dur)))
     t = np.arange(n, dtype=np.float32) * (1.0 / SAMPLE_RATE)
     w = np.sign(np.sin(_TWO_PI * float(freq) * t)).astype(np.float32)
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
     return w * env * (float(vol) * MASTER_GAIN)
+
 
 def saw_tone(freq=440.0, dur=0.2, vol=0.4):
     n = max(2, int(SAMPLE_RATE * float(dur)))
@@ -122,11 +145,13 @@ def saw_tone(freq=440.0, dur=0.2, vol=0.4):
     env = _adsr_env(n, SAMPLE_RATE, total_sec=dur)
     return w * env * (float(vol) * MASTER_GAIN)
 
+
 def noise_tone(dur=0.2, vol=0.35):
     n = max(2, int(SAMPLE_RATE * float(dur)))
     w = (np.random.rand(n).astype(np.float32) * 2.0 - 1.0)
     env = _adsr_env(n, SAMPLE_RATE, attack=0.002, decay=0.05, sustain=0.4, release=0.08, total_sec=dur)
     return w * env * (float(vol) * MASTER_GAIN)
+
 
 def wavetable_tone(freq=440.0, dur=0.2, vol=0.4, table=None):
     if table is None:
@@ -141,12 +166,14 @@ def wavetable_tone(freq=440.0, dur=0.2, vol=0.4, table=None):
     env = _adsr_env(n, SAMPLE_RATE, attack=0.002, decay=0.010, sustain=1.0, release=0.020, total_sec=dur)
     return w.astype(np.float32) * env * (float(vol) * MASTER_GAIN)
 
+
 # --------------------- Drums ---------------------
 def _drum_kick_mono(dur=0.10, vol=0.72):
     base = square_tone(60.0, dur, vol * 0.9)
     overt = square_tone(120.0, dur * 0.7, vol * 0.45)
     n = min(base.shape[0], overt.shape[0])
     return (base[:n] + overt[:n] * 0.6) * 0.95
+
 
 def _drum_snare_mono(dur=0.09, vol=0.62):
     n = max(2, int(SAMPLE_RATE * dur))
@@ -156,14 +183,17 @@ def _drum_snare_mono(dur=0.09, vol=0.62):
     m = min(n, body.shape[0])
     return (noise[:m] * env[:m] * vol * MASTER_GAIN * 0.9 + body[:m] * 0.5)
 
+
 def _drum_hat_mono(dur=0.02, vol=0.25):
     n = max(2, int(SAMPLE_RATE * dur))
     m = (np.random.rand(n).astype(np.float32) * 2.0 - 1.0)
     env = _adsr_env(n, SAMPLE_RATE, attack=0.001, decay=0.02, sustain=0.0, release=0.01, total_sec=dur)
     return m * env * (vol * MASTER_GAIN)
 
+
 def _drum_tom_mono(freq=110.0, dur=0.15, vol=0.5):
     return square_tone(freq, dur, vol)
+
 
 # --------------------- Profiles ---------------------
 def get_profiles():
@@ -257,7 +287,9 @@ def get_profiles():
         }
     }
 
+
 PROFILES = get_profiles()
+
 
 # --------------------- Chip-ish helpers ---------------------
 def _quantize_unit(x: float, steps: int):
@@ -265,6 +297,7 @@ def _quantize_unit(x: float, steps: int):
         return 0.0
     x = max(0.0, min(1.0, float(x)))
     return round(x * (steps - 1)) / (steps - 1)
+
 
 @lru_cache(maxsize=16)
 def _choose_wave_table(name: str):
@@ -276,6 +309,7 @@ def _choose_wave_table(name: str):
         w = np.round(((w + 1.0) * 7.5)) / 7.5 - 1.0
         return w.astype(np.float32)
     return np.sin(np.linspace(0, 2 * np.pi, 32, endpoint=False)).astype(np.float32)
+
 
 def _flatten_voice_spec(voice_spec):
     out = []
@@ -299,6 +333,7 @@ def _flatten_voice_spec(voice_spec):
             for i in range(cnt):
                 out.append(f"{kind}{i}")
     return out
+
 
 def assign_chip_voices(notes, profile):
     chip = profile.get("chip")
@@ -351,6 +386,7 @@ def assign_chip_voices(notes, profile):
                              voice_key=vk, wave_kind=wave_kind))
     return assigned
 
+
 def apply_stereo_width(stereo: np.ndarray, width: float):
     width = float(max(0.0, min(1.5, width)))
     L = stereo[:, 0].copy()
@@ -360,12 +396,14 @@ def apply_stereo_width(stereo: np.ndarray, width: float):
     stereo[:, 1] = M + width * (R - M)
     return stereo
 
+
 def apply_quantize(stereo: np.ndarray, mode: str | None):
     if mode is None:
         return stereo
     if mode == "8bit":
         stereo[:] = np.round(stereo * 127.0) / 127.0
     return stereo
+
 
 # --------------------- Faithful MIDI parsing ---------------------
 def collect_notes_faithful(mid: mido.MidiFile):
@@ -392,11 +430,13 @@ def collect_notes_faithful(mid: mido.MidiFile):
     out.sort(key=lambda x: x[0])
     return out
 
+
 def channels_in_notes(notes):
     used = set()
     for (_, _, _, ch, _, _) in notes:
         used.add(int(ch))
     return sorted(used)
+
 
 # --------------------- Render to float32 stereo (with profile) ---------------------
 def render_chiptune_float32(notes, profile_name="Neutral", channel_volumes=None):
@@ -413,7 +453,7 @@ def render_chiptune_float32(notes, profile_name="Neutral", channel_volumes=None)
     if not notes:
         return None
 
-    total_sec = max((end for (start, end, *_ ) in notes)) + 0.2
+    total_sec = max((end for (start, end, *_) in notes)) + 0.2
     N = int(SAMPLE_RATE * total_sec)
     mixL = np.zeros(N, dtype=np.float32)
     mixR = np.zeros(N, dtype=np.float32)
@@ -463,7 +503,6 @@ def render_chiptune_float32(notes, profile_name="Neutral", channel_volumes=None)
                 continue
 
             dur = max(0.02, float(end - start))
-            # Use pre-computed lookup table for performance
             freq = float(MIDI_TO_FREQ[pitch])
             v = (vel / 127.0) * ch_vol
 
@@ -517,7 +556,6 @@ def render_chiptune_float32(notes, profile_name="Neutral", channel_volumes=None)
             vk = item["voice_key"]
             dur = max(0.02, float(end - start))
 
-            # Use pre-computed lookup table for performance
             freq = float(MIDI_TO_FREQ[pitch])
             v = _quantize_unit(vel / 127.0, vol_steps) * ch_vol
 
@@ -583,6 +621,8 @@ def render_chiptune_float32(notes, profile_name="Neutral", channel_volumes=None)
 
     return stereo.astype(np.float32, copy=False)
 
+
+# --------------------- Export helpers ---------------------
 def export_wav_float32(path: str, stereo_f32: np.ndarray):
     stereo_i16 = (np.clip(stereo_f32, -1.0, 1.0) * 32767.0).astype(np.int16, copy=False)
     with wave.open(path, 'wb') as wf:
@@ -590,6 +630,28 @@ def export_wav_float32(path: str, stereo_f32: np.ndarray):
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(stereo_i16.tobytes())
+
+
+def export_mp3_via_ffmpeg(path: str, stereo_f32: np.ndarray, quality_q: int = 2):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise FileNotFoundError("ffmpeg not found in PATH")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp_wav = str(Path(td) / "tmp.wav")
+        export_wav_float32(tmp_wav, stereo_f32)
+
+        cmd = [
+            ffmpeg, "-y",
+            "-i", tmp_wav,
+            "-codec:a", "libmp3lame",
+            "-q:a", str(int(quality_q)),
+            str(path),
+        ]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.strip() or "ffmpeg failed")
+
 
 # --------------------- Live turntable streamer ---------------------
 class TurntablePlayer:
@@ -619,9 +681,11 @@ class TurntablePlayer:
         with self.lock:
             self.volume = volume
 
-    def stop(self):
+    def stop(self, reset_position: bool = False):
         with self.lock:
             self.playing = False
+            if reset_position:
+                self.idx = 0.0
         try:
             if self.stream is not None:
                 self.stream.stop()
@@ -638,6 +702,24 @@ class TurntablePlayer:
             except Exception:
                 pass
 
+    def resume(self):
+        """Resume if paused. If stream was closed, recreate it."""
+        try:
+            if self.stream is None:
+                self.stream = sd.OutputStream(
+                    channels=2,
+                    dtype='float32',
+                    samplerate=SAMPLE_RATE,
+                    blocksize=512,
+                    callback=self._callback
+                )
+            self.stream.start()
+            with self.lock:
+                self.playing = True
+            return True
+        except Exception:
+            return False
+
     def is_playing(self):
         return self.playing and self.stream is not None
 
@@ -647,7 +729,19 @@ class TurntablePlayer:
                 return 0.0
             return float((self.idx % (self.n - 1)) / (self.n - 1))
 
-    def _callback(self, outdata, frames, time, status):
+    def set_fraction(self, frac: float):
+        frac = max(0.0, min(1.0, float(frac)))
+        with self.lock:
+            self.idx = frac * (self.n - 1)
+
+    def get_time_seconds(self) -> float:
+        with self.lock:
+            return float(self.idx / SAMPLE_RATE)
+
+    def get_total_seconds(self) -> float:
+        return float(self.n / SAMPLE_RATE)
+
+    def _callback(self, outdata, frames, _time_info, status):
         """Optimized callback with vectorized operations for better performance."""
         out = outdata.view(dtype=np.float32).reshape((-1, 2))
         buf = self.data
@@ -655,37 +749,31 @@ class TurntablePlayer:
 
         with self.lock:
             rate = float(self.rate)
-            loop = self.loop
+            loop = bool(self.loop)
             idx = float(self.idx)
             vol = float(self.volume)
 
-        # Vectorized approach: compute all indices at once
         indices = idx + np.arange(frames, dtype=np.float32) * rate
 
         if loop:
-            # Handle looping with modulo
             indices = np.mod(indices, n - 1)
             i0 = indices.astype(np.int32)
             i1 = np.mod(i0 + 1, n)
             frac = (indices - i0).reshape(-1, 1)
-
-            # Linear interpolation (vectorized)
             out[:] = ((1.0 - frac) * buf[i0] + frac * buf[i1]) * vol
 
-            # Update index
             final_idx = float(indices[-1] + rate)
             if final_idx >= n - 1:
                 final_idx = np.mod(final_idx, n - 1)
         else:
-            # Non-looping: check if we exceed buffer
             valid_mask = indices < (n - 1)
-            valid_count = np.sum(valid_mask)
+            valid_count = int(np.sum(valid_mask))
 
             if valid_count == 0:
                 out.fill(0.0)
                 final_idx = n - 1
+                wx.CallAfter(self._later_stop_safe)
             elif valid_count < frames:
-                # Some samples are valid, rest are silence
                 valid_indices = indices[:valid_count]
                 i0 = valid_indices.astype(np.int32)
                 i1 = np.minimum(i0 + 1, n - 1)
@@ -693,33 +781,33 @@ class TurntablePlayer:
 
                 out[:valid_count] = ((1.0 - frac) * buf[i0] + frac * buf[i1]) * vol
                 out[valid_count:] = 0.0
-
-                # Stop playback
-                def _later_stop(stream=self.stream):
-                    try:
-                        if stream is not None:
-                            stream.stop()
-                    except Exception:
-                        pass
-                wx.CallAfter(_later_stop)
                 final_idx = n - 1
+                wx.CallAfter(self._later_stop_safe)
             else:
-                # All samples valid
                 i0 = indices.astype(np.int32)
                 i1 = np.minimum(i0 + 1, n - 1)
                 frac = (indices - i0).reshape(-1, 1)
-
                 out[:] = ((1.0 - frac) * buf[i0] + frac * buf[i1]) * vol
                 final_idx = float(indices[-1] + rate)
 
         with self.lock:
-            self.idx = final_idx
+            self.idx = float(final_idx)
+
+    def _later_stop_safe(self):
+        try:
+            if self.stream is not None:
+                self.stream.stop()
+        except Exception:
+            pass
+        with self.lock:
+            self.playing = False
 
     def play(self, start_at_fraction: float | None = None):
-        self.stop()
+        self.stop(reset_position=False)
         if start_at_fraction is not None:
             with self.lock:
                 self.idx = float(start_at_fraction % 1.0) * (self.n - 1)
+
         self.stream = sd.OutputStream(
             channels=2,
             dtype='float32',
@@ -732,10 +820,10 @@ class TurntablePlayer:
             self.playing = True
         return True
 
+
 # --------------------- wx GUI ---------------------
 ID_OPEN = wx.NewIdRef()
 ID_EXPORT = wx.NewIdRef()
-ID_PLAYPAUSE = wx.NewIdRef()
 ID_STOP = wx.NewIdRef()
 ID_LOOP = wx.NewIdRef()
 ID_EXIT = wx.NewIdRef()
@@ -757,17 +845,24 @@ PROFILE_ID_MAP = {
     ID_PROF_BEEPER: "Beeper",
 }
 
-def _set_accessible_name(win: wx.Window, name: str):
-    try:
-        win.SetName(name)
-    except Exception:
-        pass
+
+def _fmt_time(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    s = int(sec + 0.5)
+    m = s // 60
+    ss = s % 60
+    h = m // 60
+    mm = m % 60
+    if h > 0:
+        return f"{h}:{mm:02d}:{ss:02d}"
+    return f"{mm}:{ss:02d}"
+
 
 class MainFrame(wx.Frame):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.SetTitle("MIDI Chiptune Player — Turntable + Chip Profiles")
-        self.SetSize((980, 560))
+        self.SetSize((980, 640))
         self.Centre()
 
         self.filepath: Path | None = None
@@ -780,12 +875,19 @@ class MainFrame(wx.Frame):
         self.channel_volumes = {ch: 1.0 for ch in range(16)}
         self.used_channels = []
 
+        self._scrubbing = False
+
         self._rerender_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_rerender_timer, self._rerender_timer)
         self._rerender_pending = False
 
+        self._ui_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_ui_timer, self._ui_timer)
+
         self._build_menu()
         self._build_body()
+
+        self._ui_timer.Start(200)
 
         wx.CallAfter(self.on_open)
 
@@ -794,13 +896,12 @@ class MainFrame(wx.Frame):
 
         file_menu = wx.Menu()
         file_menu.Append(ID_OPEN, "&Open MIDI\tCtrl+O")
-        file_menu.Append(ID_EXPORT, "Export &WAV\tCtrl+S")
+        file_menu.Append(ID_EXPORT, "Export Audio...\tCtrl+S")
         file_menu.AppendSeparator()
         file_menu.Append(ID_EXIT, "E&xit\tCtrl+Q")
         menubar.Append(file_menu, "&File")
 
         play_menu = wx.Menu()
-        play_menu.Append(ID_PLAYPAUSE, "&Play/Pause\tSpace")
         play_menu.Append(ID_STOP, "&Stop")
         play_menu.AppendCheckItem(ID_LOOP, "&Loop\tCtrl+L")
         play_menu.Check(ID_LOOP, True)
@@ -823,12 +924,12 @@ class MainFrame(wx.Frame):
 
         self.SetMenuBar(menubar)
 
+        # IMPORTANT: no Space accelerator. Space stays normal for focused controls.
         accel = wx.AcceleratorTable([
             (wx.ACCEL_CTRL, ord('O'), ID_OPEN),
             (wx.ACCEL_CTRL, ord('S'), ID_EXPORT),
             (wx.ACCEL_CTRL, ord('Q'), ID_EXIT),
             (wx.ACCEL_CTRL, ord('L'), ID_LOOP),
-            (0, wx.WXK_SPACE, ID_PLAYPAUSE),
             (wx.ACCEL_CTRL, ord(','), ID_SPEED_SLOWER),
             (wx.ACCEL_CTRL, ord('.'), ID_SPEED_FASTER),
             (wx.ACCEL_CTRL, ord('0'), ID_SPEED_RESET),
@@ -842,7 +943,6 @@ class MainFrame(wx.Frame):
 
         self.Bind(wx.EVT_MENU, self.on_open, id=ID_OPEN)
         self.Bind(wx.EVT_MENU, self.on_export, id=ID_EXPORT)
-        self.Bind(wx.EVT_MENU, self.on_playpause, id=ID_PLAYPAUSE)
         self.Bind(wx.EVT_MENU, self.on_stop, id=ID_STOP)
         self.Bind(wx.EVT_MENU, self.on_toggle_loop, id=ID_LOOP)
         self.Bind(wx.EVT_MENU, self.on_exit, id=ID_EXIT)
@@ -874,49 +974,47 @@ class MainFrame(wx.Frame):
         btn_grid.AddGrowableCol(3, 1)
 
         self.btn_open = wx.Button(panel, label="Open MIDI")
-        self.btn_play = wx.Button(panel, label="Play / Pause")
+        self.btn_play_toggle = wx.ToggleButton(panel, label="Play")
         self.btn_stop = wx.Button(panel, label="Stop")
-        self.btn_export = wx.Button(panel, label="Export WAV")
+        self.btn_export = wx.Button(panel, label="Export Audio...")
 
-        for b in (self.btn_play, self.btn_stop, self.btn_export):
+        _a11y(self.btn_open, "Open MIDI button")
+        _a11y(self.btn_play_toggle, "Play/Pause toggle button", "Toggle playback. Space key works normally on focused controls.")
+        _a11y(self.btn_stop, "Stop button")
+        _a11y(self.btn_export, "Export audio button")
+
+        for b in (self.btn_play_toggle, self.btn_stop, self.btn_export):
             b.Enable(False)
 
         btn_grid.Add(self.btn_open, 0, wx.EXPAND)
-        btn_grid.Add(self.btn_play, 0, wx.EXPAND)
+        btn_grid.Add(self.btn_play_toggle, 0, wx.EXPAND)
         btn_grid.Add(self.btn_stop, 0, wx.EXPAND)
         btn_grid.Add(self.btn_export, 0, wx.EXPAND)
 
         # Loop checkbox
         self.chk_loop = wx.CheckBox(panel, label="Loop")
         self.chk_loop.SetValue(True)
+        _a11y(self.chk_loop, "Loop checkbox", "If checked, playback loops.")
 
         # --- Slider block with explicit labels (NVDA-friendly) ---
         sliders = wx.FlexGridSizer(rows=2, cols=3, vgap=10, hgap=10)
         sliders.AddGrowableCol(1, 1)
 
-        # TURNABLE SPEED (tempo+pitch) -> MUST be 50..200
+        # TURNABLE SPEED (tempo+pitch) -> 50..200
         self.lbl_speed_title = wx.StaticText(panel, label="Turntable speed (pitch+tempo)")
-        self.slider_speed = wx.Slider(
-            panel,
-            value=100,
-            minValue=50,
-            maxValue=200,
-            style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS
-        )
+        self.slider_speed = wx.Slider(panel, value=100, minValue=50, maxValue=200, style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS)
         self.slider_speed.SetTickFreq(10)
         self.lbl_speed_value = wx.StaticText(panel, label="100% (1.00x)")
 
-        # MASTER VOLUME -> MUST be 0..200
+        _a11y(self.slider_speed, "Turntable speed slider (pitch and tempo)", "Turntable speed 50 to 200 percent.")
+
+        # MASTER VOLUME -> 0..200
         self.lbl_master_title = wx.StaticText(panel, label="Master volume")
-        self.slider_master = wx.Slider(
-            panel,
-            value=100,
-            minValue=0,
-            maxValue=200,
-            style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS
-        )
+        self.slider_master = wx.Slider(panel, value=100, minValue=0, maxValue=200, style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS)
         self.slider_master.SetTickFreq(10)
         self.lbl_master_value = wx.StaticText(panel, label="100% (1.00x)")
+
+        _a11y(self.slider_master, "Master volume slider", "Master volume 0 to 200 percent. Affects playback and export.")
 
         sliders.Add(self.lbl_speed_title, 0, wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
         sliders.Add(self.slider_speed, 0, wx.EXPAND)
@@ -926,11 +1024,22 @@ class MainFrame(wx.Frame):
         sliders.Add(self.slider_master, 0, wx.EXPAND)
         sliders.Add(self.lbl_master_value, 0, wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
 
+        # --- Seek row ---
+        seek_box = wx.StaticBoxSizer(wx.StaticBox(panel, label="Position"), wx.VERTICAL)
+        self.slider_seek = wx.Slider(panel, value=0, minValue=0, maxValue=1000, style=wx.SL_HORIZONTAL)
+        self.lbl_time = wx.StaticText(panel, label="Time: 0:00 / 0:00")
+        _a11y(self.slider_seek, "Playback position slider", "Scrub playback position. 0 to 1000.")
+        _a11y(self.lbl_time, "Time label")
+
+        seek_box.Add(self.slider_seek, 0, wx.EXPAND | wx.ALL, 6)
+        seek_box.Add(self.lbl_time, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         # Profile label
         self.lbl_profile = wx.StaticText(panel, label="Profile: Neutral")
+        _a11y(self.lbl_profile, "Profile label")
 
         # --- Per-channel volume section (scroll) ---
-        self.channel_box = wx.StaticBox(panel, label="Per MIDI channel volume (re-renders)")
+        self.channel_box = wx.StaticBox(panel, label="Per used MIDI channel volume (auto re-render)")
         self.channel_sizer = wx.StaticBoxSizer(self.channel_box, wx.VERTICAL)
 
         self.scroll = wx.ScrolledWindow(panel, style=wx.VSCROLL)
@@ -945,6 +1054,7 @@ class MainFrame(wx.Frame):
         root.Add(btn_grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.chk_loop, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(sliders, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        root.Add(seek_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.lbl_profile, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.channel_sizer, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
@@ -952,23 +1062,27 @@ class MainFrame(wx.Frame):
 
         # Bind
         self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
-        self.btn_play.Bind(wx.EVT_BUTTON, self.on_playpause)
+        self.btn_play_toggle.Bind(wx.EVT_TOGGLEBUTTON, self.on_play_toggle)
         self.btn_stop.Bind(wx.EVT_BUTTON, self.on_stop)
         self.btn_export.Bind(wx.EVT_BUTTON, self.on_export)
         self.chk_loop.Bind(wx.EVT_CHECKBOX, self.on_toggle_loop)
         self.slider_speed.Bind(wx.EVT_SLIDER, self.on_speed_change)
         self.slider_master.Bind(wx.EVT_SLIDER, self.on_master_change)
 
-        # Tooltips + NVDA names
-        self.slider_speed.SetToolTip("Turntable speed: changes pitch and tempo like vinyl (50%..200%)")
-        _set_accessible_name(self.slider_speed, "Turntable speed slider (pitch and tempo)")
+        # Seek events
+        self.slider_seek.Bind(wx.EVT_SCROLL_THUMBTRACK, self.on_seek_track)
+        self.slider_seek.Bind(wx.EVT_SCROLL_THUMBRELEASE, self.on_seek_release)
+        self.slider_seek.Bind(wx.EVT_SLIDER, self.on_seek_release)  # fallback
 
-        self.slider_master.SetToolTip("Master volume (0%..200%), affects playback volume")
-        _set_accessible_name(self.slider_master, "Master volume slider")
+        # Tooltips (optional)
+        self.slider_speed.SetToolTip("Turntable speed: changes pitch and tempo like vinyl (50%..200%)")
+        self.slider_master.SetToolTip("Master volume (0%..200%), affects playback and export")
+        self.slider_seek.SetToolTip("Scrub/seek position")
 
         # initial labels
         self._refresh_speed_label()
         self._refresh_master_label()
+        self._refresh_time_label(0.0, 0.0)
 
         # init channel list UI
         self.build_channel_sliders()
@@ -991,10 +1105,12 @@ class MainFrame(wx.Frame):
         vol = self.get_master_rate()
         self.lbl_master_value.SetLabel(f"{int(vol * 100)}% ({vol:.2f}x)")
 
+    def _refresh_time_label(self, cur_sec: float, total_sec: float):
+        self.lbl_time.SetLabel(f"Time: {_fmt_time(cur_sec)} / {_fmt_time(total_sec)}")
+
     def set_speed(self, rate: float):
         rate = max(0.1, min(3.0, float(rate)))
         val = int(round(rate * 100))
-        # keep in slider bounds (50..200)
         val = max(50, min(200, val))
         self.slider_speed.SetValue(val)
         self._refresh_speed_label()
@@ -1004,13 +1120,17 @@ class MainFrame(wx.Frame):
     def nudge_speed(self, mul: float):
         self.set_speed(self.get_speed_rate() * mul)
 
-    def stop_player(self):
+    def stop_player(self, reset_position: bool = False):
         if self.player:
             try:
-                self.player.stop()
+                self.player.stop(reset_position=reset_position)
             except Exception:
                 pass
         self.player = None
+
+    def _set_play_toggle_ui(self, playing: bool):
+        self.btn_play_toggle.SetValue(bool(playing))
+        self.btn_play_toggle.SetLabel("Pause" if playing else "Play")
 
     def build_channel_sliders(self):
         self.scroll.Freeze()
@@ -1048,7 +1168,7 @@ class MainFrame(wx.Frame):
                 s.SetTickFreq(10)
                 val_lbl = wx.StaticText(self.scroll, label=f"{s.GetValue()}%")
 
-                _set_accessible_name(s, f"Volume slider for {label_txt}")
+                _a11y(s, f"Volume slider for {label_txt}", f"Volume for {label_txt}. 0 to 200 percent. Changing re-renders automatically.")
                 s.SetToolTip(f"Volume for {label_txt} (0%..200%). Changing it re-renders.")
 
                 def make_handler(channel):
@@ -1089,11 +1209,11 @@ class MainFrame(wx.Frame):
             return
 
         old_playing = bool(self.player and self.player.is_playing())
-        old_frac = self.player.get_fraction() if (self.player) else 0.0
+        old_frac = self.player.get_fraction() if self.player else 0.0
         old_rate = self.get_speed_rate()
 
         self.set_status(f"{reason}: rendering...")
-        self.stop_player()
+        self.stop_player(reset_position=False)
 
         chan_vol = {int(k): float(v) for k, v in self.channel_volumes.items()}
 
@@ -1108,6 +1228,7 @@ class MainFrame(wx.Frame):
             def done():
                 if audio is None:
                     self.set_status(f"Render error: {err}")
+                    wx.MessageBox(f"Could not render MIDI:\n{err}", "Error", wx.OK | wx.ICON_ERROR, self)
                     return
 
                 self.audio_f32 = audio
@@ -1115,13 +1236,20 @@ class MainFrame(wx.Frame):
 
                 if old_playing and keep_playback_position:
                     try:
-                        self.player = TurntablePlayer(self.audio_f32.copy(), loop=self.chk_loop.GetValue(),
-                                                     volume=self.get_master_rate())
+                        self.player = TurntablePlayer(
+                            self.audio_f32.copy(),
+                            loop=self.chk_loop.GetValue(),
+                            volume=self.get_master_rate()
+                        )
                         self.player.set_rate(old_rate)
                         self.player.play(start_at_fraction=old_frac)
                         self.set_status(f"Playing ({self.profile_name}).")
+                        self._set_play_toggle_ui(True)
                     except Exception as e2:
                         self.set_status(f"Audio error after re-render: {e2}")
+                        self._set_play_toggle_ui(False)
+                else:
+                    self._set_play_toggle_ui(False)
 
             wx.CallAfter(done)
 
@@ -1129,9 +1257,12 @@ class MainFrame(wx.Frame):
 
     # ---------- Events ----------
     def on_open(self, event=None):
-        with wx.FileDialog(self, "Choose MIDI file",
-                           wildcard="MIDI files (*.mid;*.midi)|*.mid;*.midi",
-                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+        with wx.FileDialog(
+            self,
+            "Choose MIDI file",
+            wildcard="MIDI files (*.mid;*.midi)|*.mid;*.midi",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST
+        ) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
             path = dlg.GetPath()
@@ -1139,9 +1270,12 @@ class MainFrame(wx.Frame):
         self.filepath = Path(path)
         self.lbl_file.SetLabel(f"File: {self.filepath.name}")
         self.set_status("Parsing + rendering...")
-        for b in (self.btn_play, self.btn_stop, self.btn_export):
+
+        for b in (self.btn_play_toggle, self.btn_stop, self.btn_export):
             b.Enable(False)
-        self.stop_player()
+        self._set_play_toggle_ui(False)
+
+        self.stop_player(reset_position=True)
 
         def worker():
             err = None
@@ -1154,8 +1288,7 @@ class MainFrame(wx.Frame):
                 used = channels_in_notes(notes)
                 for ch in used:
                     self.channel_volumes.setdefault(ch, 1.0)
-                audio = render_chiptune_float32(notes, profile_name=self.profile_name,
-                                                channel_volumes=self.channel_volumes)
+                audio = render_chiptune_float32(notes, profile_name=self.profile_name, channel_volumes=self.channel_volumes)
             except Exception as e:
                 err = e
 
@@ -1175,37 +1308,66 @@ class MainFrame(wx.Frame):
 
                 self.audio_f32 = audio
                 self.set_status("Ready.")
-                for b in (self.btn_play, self.btn_stop, self.btn_export):
+                for b in (self.btn_play_toggle, self.btn_stop, self.btn_export):
                     b.Enable(True)
-                self.on_playpause()
+
+                # reset seek display
+                self.slider_seek.SetValue(0)
+                total = self.audio_f32.shape[0] / SAMPLE_RATE
+                self._refresh_time_label(0.0, total)
 
             wx.CallAfter(done)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def on_playpause(self, event=None):
+    def on_play_toggle(self, event=None):
         if self.audio_f32 is None:
+            self._set_play_toggle_ui(False)
             return
-        if self.player and self.player.is_playing():
-            try:
+
+        want_play = bool(self.btn_play_toggle.GetValue())
+
+        if not want_play:
+            # Pause
+            if self.player:
                 self.player.pause()
-            except Exception:
-                pass
             self.set_status("Paused.")
+            self._set_play_toggle_ui(False)
             return
+
+        # Play / Resume
         try:
-            self.player = TurntablePlayer(self.audio_f32.copy(), loop=self.chk_loop.GetValue(),
-                                          volume=self.get_master_rate())
+            if self.player is not None and not self.player.is_playing():
+                self.player.set_loop(self.chk_loop.GetValue())
+                self.player.set_rate(self.get_speed_rate())
+                self.player.set_volume(self.get_master_rate())
+                if self.player.resume():
+                    self.set_status(f"Playing ({self.profile_name}).")
+                    self._set_play_toggle_ui(True)
+                    return
+
+            # Start new
+            self.player = TurntablePlayer(
+                self.audio_f32.copy(),
+                loop=self.chk_loop.GetValue(),
+                volume=self.get_master_rate()
+            )
             self.player.set_rate(self.get_speed_rate())
-            self.player.play()
+            self.player.play(start_at_fraction=self.slider_seek.GetValue() / 1000.0)
             self.set_status(f"Playing (turntable mode, {self.profile_name}).")
+            self._set_play_toggle_ui(True)
         except Exception as e:
             self.set_status(f"Audio error: {e}")
             wx.MessageBox(f"Audio error:\n{e}", "Audio error", wx.OK | wx.ICON_ERROR, self)
+            self._set_play_toggle_ui(False)
 
     def on_stop(self, event=None):
-        self.stop_player()
+        self.stop_player(reset_position=True)
         self.set_status("Stopped.")
+        self._set_play_toggle_ui(False)
+        self.slider_seek.SetValue(0)
+        total = (self.audio_f32.shape[0] / SAMPLE_RATE) if self.audio_f32 is not None else 0.0
+        self._refresh_time_label(0.0, total)
 
     def on_toggle_loop(self, event=None):
         if self.player:
@@ -1213,16 +1375,57 @@ class MainFrame(wx.Frame):
         self.set_status(f"Loop {'on' if self.chk_loop.GetValue() else 'off'}.")
 
     def on_speed_change(self, event):
-        # This is the TURNABLE SPEED slider (50..200)
         self._refresh_speed_label()
         if self.player:
             self.player.set_rate(self.get_speed_rate())
 
     def on_master_change(self, event):
-        # This is the MASTER VOLUME slider (0..200)
         self._refresh_master_label()
         if self.player:
             self.player.set_volume(self.get_master_rate())
+
+    def on_seek_track(self, event):
+        if self.audio_f32 is None:
+            return
+        self._scrubbing = True
+        frac = self.slider_seek.GetValue() / 1000.0
+        total = self.audio_f32.shape[0] / SAMPLE_RATE
+        self._refresh_time_label(frac * total, total)
+
+    def on_seek_release(self, event):
+        if self.audio_f32 is None:
+            self._scrubbing = False
+            return
+        frac = self.slider_seek.GetValue() / 1000.0
+        total = self.audio_f32.shape[0] / SAMPLE_RATE
+        self._refresh_time_label(frac * total, total)
+
+        if self.player:
+            self.player.set_fraction(frac)
+            # If currently playing, keep going
+            if self.btn_play_toggle.GetValue():
+                self.player.resume()
+
+        self._scrubbing = False
+
+    def _on_ui_timer(self, event):
+        if self.audio_f32 is None or self._scrubbing:
+            return
+
+        total = self.audio_f32.shape[0] / SAMPLE_RATE
+        cur = 0.0
+        if self.player:
+            cur = self.player.get_time_seconds()
+            if total > 0 and self.chk_loop.GetValue():
+                cur = cur % total
+
+        frac = 0.0 if total <= 0 else max(0.0, min(1.0, cur / total))
+        self.slider_seek.SetValue(int(round(frac * 1000.0)))
+        self._refresh_time_label(cur, total)
+
+        # reflect stopped playback in toggle
+        if self.player and not self.player.is_playing() and self.btn_play_toggle.GetValue():
+            self._set_play_toggle_ui(False)
 
     def on_channel_volume_change(self, ch: int):
         if hasattr(self, "_channel_widgets") and ch in self._channel_widgets:
@@ -1236,18 +1439,55 @@ class MainFrame(wx.Frame):
         if self.audio_f32 is None:
             wx.MessageBox("Nothing to export.", "Info", wx.OK | wx.ICON_INFORMATION, self)
             return
-        default = (self.filepath.stem if self.filepath else "output") + f"_{self.profile_name}.wav"
-        with wx.FileDialog(self, "Save WAV", wildcard="WAV files (*.wav)|*.wav",
-                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT, defaultFile=default) as dlg:
+
+        base = (self.filepath.stem if self.filepath else "output") + f"_{self.profile_name}"
+        default = base + ".wav"
+
+        wildcard = "WAV files (*.wav)|*.wav|MP3 files (*.mp3)|*.mp3"
+        with wx.FileDialog(
+            self,
+            "Export Audio",
+            wildcard=wildcard,
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT,
+            defaultFile=default
+        ) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
-            out = dlg.GetPath()
+            out = Path(dlg.GetPath())
+            filter_idx = dlg.GetFilterIndex()  # 0=wav, 1=mp3
+
+        want_ext = ".wav" if filter_idx == 0 else ".mp3"
+        if out.suffix.lower() not in (".wav", ".mp3"):
+            out = out.with_suffix(want_ext)
+        elif out.suffix.lower() != want_ext:
+            out = out.with_suffix(want_ext)
+
+        # Apply master volume to export as well (so export matches what you hear).
+        export_buf = self.audio_f32 * float(self.get_master_rate())
+
         try:
-            export_wav_float32(out, self.audio_f32 * float(self.get_master_rate()))
+            if out.suffix.lower() == ".wav":
+                export_wav_float32(str(out), export_buf)
+                self.set_status(f"WAV saved: {out.name}")
+            else:
+                try:
+                    export_mp3_via_ffmpeg(str(out), export_buf, quality_q=2)
+                    self.set_status(f"MP3 saved: {out.name}")
+                except FileNotFoundError:
+                    wx.MessageBox(
+                        "MP3 export needs FFmpeg.\n\n"
+                        "Install FFmpeg and make sure 'ffmpeg' is in PATH.\n\n"
+                        "Windows (winget):\n"
+                        "  winget install -e --id Gyan.FFmpeg\n\n"
+                        "Then restart this app and try again.",
+                        "FFmpeg not found",
+                        wx.OK | wx.ICON_WARNING,
+                        self
+                    )
+                except Exception as e:
+                    wx.MessageBox(f"Could not export MP3:\n{e}", "Export error", wx.OK | wx.ICON_ERROR, self)
         except Exception as e:
-            wx.MessageBox(f"Could not write WAV:\n{e}", "Export error", wx.OK | wx.ICON_ERROR, self)
-            return
-        self.set_status(f"WAV saved: {Path(out).name}")
+            wx.MessageBox(f"Could not write file:\n{e}", "Export error", wx.OK | wx.ICON_ERROR, self)
 
     def on_select_profile(self, event):
         new_name = PROFILE_ID_MAP.get(event.GetId(), "Neutral")
@@ -1255,13 +1495,14 @@ class MainFrame(wx.Frame):
             return
 
         old_playing = bool(self.player and self.player.is_playing())
-        old_frac = self.player.get_fraction() if (self.player) else 0.0
+        old_frac = self.player.get_fraction() if self.player else 0.0
         old_rate = self.get_speed_rate()
 
         self.profile_name = new_name
         self.lbl_profile.SetLabel(f"Profile: {self.profile_name}")
         self.set_status(f"Rendering with profile '{self.profile_name}'...")
-        self.stop_player()
+        self.stop_player(reset_position=False)
+        self._set_play_toggle_ui(False)
 
         if self.notes is None:
             self.set_status("No MIDI loaded; profile will apply to next file.")
@@ -1280,6 +1521,7 @@ class MainFrame(wx.Frame):
             def done():
                 if audio is None:
                     self.set_status(f"Render error: {err}")
+                    wx.MessageBox(f"Could not render MIDI:\n{err}", "Error", wx.OK | wx.ICON_ERROR, self)
                     return
 
                 self.audio_f32 = audio
@@ -1287,27 +1529,34 @@ class MainFrame(wx.Frame):
 
                 if old_playing:
                     try:
-                        self.player = TurntablePlayer(self.audio_f32.copy(), loop=self.chk_loop.GetValue(),
-                                                     volume=self.get_master_rate())
+                        self.player = TurntablePlayer(
+                            self.audio_f32.copy(),
+                            loop=self.chk_loop.GetValue(),
+                            volume=self.get_master_rate()
+                        )
                         self.player.set_rate(old_rate)
                         self.player.play(start_at_fraction=old_frac)
                         self.set_status(f"Playing ({self.profile_name}).")
+                        self._set_play_toggle_ui(True)
                     except Exception as e2:
                         self.set_status(f"Audio error after profile switch: {e2}")
+                        self._set_play_toggle_ui(False)
 
             wx.CallAfter(done)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def on_exit(self, event=None):
-        self.stop_player()
+        self.stop_player(reset_position=False)
         self.Close()
+
 
 class App(wx.App):
     def OnInit(self):
         self.frame = MainFrame(None)
         self.frame.Show(True)
         return True
+
 
 if __name__ == "__main__":
     app = App(False)
