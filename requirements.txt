@@ -1,5 +1,6 @@
 numpy
 wxpython
 mido
+python-rtmidi
 sounddevice
 numba

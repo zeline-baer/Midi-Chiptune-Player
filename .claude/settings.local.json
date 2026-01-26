@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile:*)",
+      "Bash(py -m py_compile:*)",
+      "Bash(timeout 5 py:*)",
+      "Bash(py test_live_midi.py:*)",
+      "Bash(py test_functionality.py:*)",
+      "Bash(py -c:*)",
+      "Bash(py -m pip install:*)"
+    ]
+  }
+}

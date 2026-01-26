@@ -14,6 +14,7 @@ import subprocess
 import shutil
 from pathlib import Path
 from functools import lru_cache
+from dataclasses import dataclass, field
 
 import numpy as np
 import mido
@@ -167,6 +168,94 @@ def wavetable_tone(freq=440.0, dur=0.2, vol=0.4, table=None):
     return w.astype(np.float32) * env * (float(vol) * MASTER_GAIN)
 
 
+# --------------------- Real-time waveform functions (for live MIDI) ---------------------
+def _rt_pulse_sample(phase: float, duty: float) -> float:
+    """Single pulse sample at given phase (0.0-1.0)."""
+    return 1.0 if (phase % 1.0) < duty else -1.0
+
+
+def _rt_triangle_sample(phase: float) -> float:
+    """Single triangle sample at given phase (0.0-1.0)."""
+    p = phase % 1.0
+    return 4.0 * abs(p - 0.5) - 1.0
+
+
+def _rt_square_sample(phase: float) -> float:
+    """Single square sample at given phase (0.0-1.0)."""
+    return 1.0 if (phase % 1.0) < 0.5 else -1.0
+
+
+def _rt_saw_sample(phase: float) -> float:
+    """Single sawtooth sample at given phase (0.0-1.0)."""
+    return 2.0 * (phase % 1.0) - 1.0
+
+
+# Vectorized versions for buffer generation (much faster)
+def _rt_generate_pulse_buffer(start_phase: float, freq: float, duty: float,
+                               frames: int, pitch_bend_semitones: float = 0.0,
+                               vibrato_depth: float = 0.0, vibrato_rate: float = 5.0,
+                               vibrato_phase: float = 0.0) -> tuple[np.ndarray, float, float]:
+    """Generate pulse buffer with optional pitch bend and vibrato. Returns (samples, end_phase, end_vib_phase)."""
+    t = np.arange(frames, dtype=np.float32) / SAMPLE_RATE
+
+    # Apply pitch bend (±2 semitones)
+    bent_freq = freq * (2.0 ** (pitch_bend_semitones / 12.0))
+
+    # Apply vibrato (LFO)
+    if vibrato_depth > 0.0:
+        vib_t = vibrato_phase + vibrato_rate * t
+        lfo = np.sin(_TWO_PI * vib_t)
+        # Vibrato depth in cents (max ~50 cents)
+        cents = lfo * vibrato_depth * 50.0
+        inst_freq = bent_freq * (2.0 ** (cents / 1200.0))
+        phases = start_phase + np.cumsum(inst_freq / SAMPLE_RATE)
+        end_vib_phase = float(vib_t[-1]) % 1.0 if frames > 0 else vibrato_phase
+    else:
+        phases = start_phase + bent_freq * t
+        end_vib_phase = vibrato_phase
+
+    frac = np.mod(phases, 1.0)
+    samples = np.where(frac < duty, 1.0, -1.0).astype(np.float32)
+    end_phase = float(phases[-1]) % 1.0 if frames > 0 else start_phase
+    return samples, end_phase, end_vib_phase
+
+
+def _rt_generate_triangle_buffer(start_phase: float, freq: float, frames: int,
+                                  pitch_bend_semitones: float = 0.0) -> tuple[np.ndarray, float]:
+    """Generate triangle buffer. Returns (samples, end_phase)."""
+    t = np.arange(frames, dtype=np.float32) / SAMPLE_RATE
+    bent_freq = freq * (2.0 ** (pitch_bend_semitones / 12.0))
+    phases = start_phase + bent_freq * t
+    frac = np.mod(phases, 1.0)
+    samples = (4.0 * np.abs(frac - 0.5) - 1.0).astype(np.float32)
+    end_phase = float(phases[-1]) % 1.0 if frames > 0 else start_phase
+    return samples, end_phase
+
+
+def _rt_generate_square_buffer(start_phase: float, freq: float, frames: int,
+                                pitch_bend_semitones: float = 0.0) -> tuple[np.ndarray, float]:
+    """Generate square buffer. Returns (samples, end_phase)."""
+    t = np.arange(frames, dtype=np.float32) / SAMPLE_RATE
+    bent_freq = freq * (2.0 ** (pitch_bend_semitones / 12.0))
+    phases = start_phase + bent_freq * t
+    frac = np.mod(phases, 1.0)
+    samples = np.where(frac < 0.5, 1.0, -1.0).astype(np.float32)
+    end_phase = float(phases[-1]) % 1.0 if frames > 0 else start_phase
+    return samples, end_phase
+
+
+def _rt_generate_saw_buffer(start_phase: float, freq: float, frames: int,
+                             pitch_bend_semitones: float = 0.0) -> tuple[np.ndarray, float]:
+    """Generate sawtooth buffer. Returns (samples, end_phase)."""
+    t = np.arange(frames, dtype=np.float32) / SAMPLE_RATE
+    bent_freq = freq * (2.0 ** (pitch_bend_semitones / 12.0))
+    phases = start_phase + bent_freq * t
+    frac = np.mod(phases, 1.0)
+    samples = (2.0 * frac - 1.0).astype(np.float32)
+    end_phase = float(phases[-1]) % 1.0 if frames > 0 else start_phase
+    return samples, end_phase
+
+
 # --------------------- Drums ---------------------
 def _drum_kick_mono(dur=0.10, vol=0.72):
     base = square_tone(60.0, dur, vol * 0.9)
@@ -289,6 +378,46 @@ def get_profiles():
 
 
 PROFILES = get_profiles()
+
+
+# --------------------- Live MIDI Voice ---------------------
+@dataclass
+class LiveVoice:
+    """Single voice state for real-time MIDI synthesis."""
+    active: bool = False
+    note: int = 0
+    channel: int = 0
+    velocity: float = 0.0
+    freq: float = 440.0
+    phase: float = 0.0
+    env_phase: int = 0      # 0=attack, 1=decay, 2=sustain, 3=release, 4=off
+    env_pos: int = 0
+    env_level: float = 0.0
+    wave_kind: str = "pulse"
+    duty: float = 0.5
+    start_time: float = 0.0
+    # MIDI controller state
+    pitch_bend: float = 0.0      # -1.0 to +1.0 (±2 semitones)
+    vibrato_depth: float = 0.0   # 0.0 to 1.0 (from mod wheel)
+    sustained: bool = False      # Held by sustain pedal
+
+    def reset(self):
+        """Reset voice to inactive state."""
+        self.active = False
+        self.note = 0
+        self.channel = 0
+        self.velocity = 0.0
+        self.freq = 440.0
+        self.phase = 0.0
+        self.env_phase = 4
+        self.env_pos = 0
+        self.env_level = 0.0
+        self.wave_kind = "pulse"
+        self.duty = 0.5
+        self.start_time = 0.0
+        self.pitch_bend = 0.0
+        self.vibrato_depth = 0.0
+        self.sustained = False
 
 
 # --------------------- Chip-ish helpers ---------------------
@@ -821,6 +950,448 @@ class TurntablePlayer:
         return True
 
 
+# --------------------- Live MIDI Player ---------------------
+class LiveMidiPlayer:
+    """Real-time MIDI input synthesizer for live keyboard playing."""
+
+    # ADSR timing in samples (at 44100 Hz)
+    ATTACK_SAMPLES = int(0.008 * SAMPLE_RATE)   # 8ms
+    DECAY_SAMPLES = int(0.050 * SAMPLE_RATE)    # 50ms
+    SUSTAIN_LEVEL = 0.65
+    RELEASE_SAMPLES = int(0.120 * SAMPLE_RATE)  # 120ms
+
+    def __init__(self, num_voices: int = 12, profile_name: str = "Neutral"):
+        self.num_voices = num_voices
+        self.voices: list[LiveVoice] = [LiveVoice() for _ in range(num_voices)]
+        self.profile_name = profile_name
+        self.volume = 0.8
+        self.active = False
+
+        self.midi_port: mido.ports.BaseInput | None = None
+        self.stream: sd.OutputStream | None = None
+        self.lock = threading.Lock()
+
+        # Per-channel state for controllers
+        self._channel_pitch_bend: dict[int, float] = {ch: 0.0 for ch in range(16)}
+        self._channel_mod_wheel: dict[int, float] = {ch: 0.0 for ch in range(16)}
+        self._channel_sustain: dict[int, bool] = {ch: False for ch in range(16)}
+
+        # Vibrato phase tracking per voice (for continuous LFO)
+        self._voice_vib_phase: list[float] = [0.0 for _ in range(num_voices)]
+
+        # Status callback for UI updates
+        self._status_callback = None
+
+    def set_status_callback(self, callback):
+        """Set callback for status updates (active voice count, etc.)."""
+        self._status_callback = callback
+
+    def _notify_status(self):
+        """Notify status callback if set."""
+        if self._status_callback:
+            with self.lock:
+                active_count = sum(1 for v in self.voices if v.active)
+            try:
+                wx.CallAfter(self._status_callback, active_count)
+            except Exception:
+                pass
+
+    # ----- MIDI Port Management -----
+    def list_midi_inputs(self) -> list[str]:
+        """List available MIDI input ports."""
+        try:
+            return mido.get_input_names()
+        except Exception:
+            return []
+
+    def open_midi_input(self, port_name: str | None = None) -> bool:
+        """Open MIDI input port. Returns True on success."""
+        self.close_midi_input()
+        try:
+            if port_name is None:
+                ports = self.list_midi_inputs()
+                if not ports:
+                    return False
+                port_name = ports[0]
+
+            self.midi_port = mido.open_input(port_name, callback=self._midi_callback)
+            return True
+        except Exception as e:
+            print(f"MIDI open error: {e}")
+            return False
+
+    def close_midi_input(self):
+        """Close MIDI input port."""
+        if self.midi_port is not None:
+            try:
+                self.midi_port.close()
+            except Exception:
+                pass
+            self.midi_port = None
+
+    def get_midi_port_name(self) -> str | None:
+        """Get currently open MIDI port name."""
+        if self.midi_port is not None:
+            try:
+                return self.midi_port.name
+            except Exception:
+                pass
+        return None
+
+    # ----- Audio Stream Management -----
+    def start(self) -> bool:
+        """Start audio output stream."""
+        if self.active:
+            return True
+        try:
+            self.stream = sd.OutputStream(
+                channels=2,
+                dtype='float32',
+                samplerate=SAMPLE_RATE,
+                blocksize=256,  # Low latency
+                latency='low',
+                callback=self._audio_callback
+            )
+            self.stream.start()
+            self.active = True
+            return True
+        except Exception as e:
+            print(f"Audio stream error: {e}")
+            return False
+
+    def stop(self):
+        """Stop audio output stream."""
+        self.active = False
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        # Clear all voices
+        with self.lock:
+            for v in self.voices:
+                v.reset()
+
+    def set_volume(self, volume: float):
+        """Set live playback volume (0.0 to 2.0)."""
+        with self.lock:
+            self.volume = max(0.0, min(2.0, float(volume)))
+
+    def set_profile(self, profile_name: str):
+        """Set chip profile for timbre."""
+        with self.lock:
+            self.profile_name = profile_name
+
+    # ----- MIDI Callback (runs on MIDI thread) -----
+    def _midi_callback(self, msg: mido.Message):
+        """Handle incoming MIDI messages."""
+        if msg.type == 'note_on' and msg.velocity > 0:
+            self._note_on(msg.note, msg.velocity, msg.channel)
+        elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+            self._note_off(msg.note, msg.channel)
+        elif msg.type == 'control_change':
+            self._handle_cc(msg.control, msg.value, msg.channel)
+        elif msg.type == 'pitchwheel':
+            self._handle_pitch_bend(msg.pitch, msg.channel)
+
+    def _handle_cc(self, control: int, value: int, channel: int):
+        """Handle Control Change messages."""
+        with self.lock:
+            if control == 1:  # Mod Wheel
+                self._channel_mod_wheel[channel] = value / 127.0
+                # Update active voices on this channel
+                for v in self.voices:
+                    if v.active and v.channel == channel:
+                        v.vibrato_depth = value / 127.0
+            elif control == 64:  # Sustain Pedal
+                sustain_on = value >= 64
+                old_sustain = self._channel_sustain.get(channel, False)
+                self._channel_sustain[channel] = sustain_on
+
+                if not sustain_on and old_sustain:
+                    # Pedal released - release all sustained notes on this channel
+                    for v in self.voices:
+                        if v.active and v.channel == channel and v.sustained:
+                            v.sustained = False
+                            v.env_phase = 3  # Start release
+                            v.env_pos = 0
+
+    def _handle_pitch_bend(self, pitch: int, channel: int):
+        """Handle Pitch Bend messages."""
+        # pitch is -8192 to +8191, map to ±2 semitones
+        bend_semitones = (pitch / 8192.0) * 2.0
+        with self.lock:
+            self._channel_pitch_bend[channel] = bend_semitones
+            # Update active voices on this channel
+            for v in self.voices:
+                if v.active and v.channel == channel:
+                    v.pitch_bend = bend_semitones
+
+    def _note_on(self, note: int, velocity: int, channel: int):
+        """Activate a voice for a new note."""
+        with self.lock:
+            # Find free voice or steal oldest
+            voice_idx = self._find_free_voice()
+            if voice_idx < 0:
+                voice_idx = self._steal_oldest_voice()
+
+            voice = self.voices[voice_idx]
+
+            # Get timbre from profile
+            profile = PROFILES.get(self.profile_name, PROFILES["Neutral"])
+            timbre = profile["timbre"]
+            chip = profile.get("chip")
+
+            # Determine voice key and settings
+            if chip:
+                voice_keys = _flatten_voice_spec(chip["voices"])
+                # Simple round-robin assignment based on channel
+                vk = voice_keys[channel % len(voice_keys)]
+                settings = timbre.get(vk, {"wave": "pulse", "duty": 0.5})
+            else:
+                settings = timbre.get(channel % 6, {"wave": "pulse", "duty": 0.5})
+
+            # Initialize voice
+            voice.active = True
+            voice.note = note
+            voice.channel = channel
+            voice.velocity = velocity / 127.0
+            voice.freq = MIDI_TO_FREQ[note] if 0 <= note < 128 else 440.0
+            voice.phase = 0.0
+            voice.env_phase = 0  # Attack
+            voice.env_pos = 0
+            voice.env_level = 0.0
+            voice.start_time = time.time()
+
+            voice.wave_kind = settings.get("wave", "pulse")
+            voice.duty = settings.get("duty", 0.5) or 0.5
+
+            # Apply current controller state
+            voice.pitch_bend = self._channel_pitch_bend.get(channel, 0.0)
+            voice.vibrato_depth = self._channel_mod_wheel.get(channel, 0.0)
+            voice.sustained = False
+
+            # Reset vibrato phase for this voice
+            self._voice_vib_phase[voice_idx] = 0.0
+
+        self._notify_status()
+
+    def _note_off(self, note: int, channel: int):
+        """Release a note (start release phase or mark as sustained)."""
+        with self.lock:
+            sustain_on = self._channel_sustain.get(channel, False)
+
+            # Release ALL voices with this note/channel (not just the first one)
+            for v in self.voices:
+                if v.active and v.note == note and v.channel == channel and v.env_phase < 3:
+                    if sustain_on:
+                        # Mark as sustained, don't release yet
+                        v.sustained = True
+                    else:
+                        # Start release phase
+                        v.env_phase = 3
+                        v.env_pos = 0
+                    # Don't break - release all matching voices
+
+        self._notify_status()
+
+    def _find_free_voice(self) -> int:
+        """Find an inactive voice or one in release phase. Returns -1 if none available."""
+        # First, look for completely inactive voices
+        for i, v in enumerate(self.voices):
+            if not v.active:
+                return i
+
+        # Second, look for voices in release phase (can be reused)
+        for i, v in enumerate(self.voices):
+            if v.active and v.env_phase >= 3:  # Release or off
+                return i
+
+        return -1
+
+    def _steal_oldest_voice(self) -> int:
+        """Steal the oldest active voice, preferring those in release phase."""
+        # First try to steal a voice in release phase
+        oldest_release_idx = -1
+        oldest_release_time = float('inf')
+
+        oldest_idx = 0
+        oldest_time = float('inf')
+
+        for i, v in enumerate(self.voices):
+            if v.active:
+                if v.env_phase >= 3 and v.start_time < oldest_release_time:
+                    oldest_release_time = v.start_time
+                    oldest_release_idx = i
+                if v.start_time < oldest_time:
+                    oldest_time = v.start_time
+                    oldest_idx = i
+
+        # Prefer stealing a voice already in release
+        if oldest_release_idx >= 0:
+            return oldest_release_idx
+        return oldest_idx
+
+    # ----- Audio Callback (runs on audio thread) -----
+    def _audio_callback(self, outdata, frames, time_info, status):
+        """Generate audio for all active voices."""
+        out = outdata.view(dtype=np.float32).reshape((-1, 2))
+        out.fill(0.0)
+
+        if not self.active:
+            return
+
+        with self.lock:
+            vol = self.volume
+            profile = PROFILES.get(self.profile_name, PROFILES["Neutral"])
+            pan_map = profile["pan_map"]
+            stereo_width = profile["stereo_width"]
+
+            # Process each voice
+            for i, voice in enumerate(self.voices):
+                if not voice.active:
+                    continue
+
+                # Generate waveform buffer
+                samples, new_phase, new_vib_phase = self._generate_voice_buffer(
+                    voice, frames, self._voice_vib_phase[i]
+                )
+
+                # Apply envelope
+                env_samples, new_env_phase, new_env_pos, new_env_level, still_active = \
+                    self._apply_envelope(voice, frames)
+
+                # Combine waveform with envelope
+                samples = samples * env_samples * voice.velocity * vol * MASTER_GAIN
+
+                # Apply panning
+                vk = self._get_voice_key(voice)
+                pan = pan_map.get(vk, pan_map.get(voice.channel % 6, 0.0))
+                gL, gR = _pan_gains(pan)
+
+                # Mix into output
+                out[:, 0] += samples * gL
+                out[:, 1] += samples * gR
+
+                # Update voice state
+                voice.phase = new_phase
+                voice.env_phase = new_env_phase
+                voice.env_pos = new_env_pos
+                voice.env_level = new_env_level
+                self._voice_vib_phase[i] = new_vib_phase
+
+                if not still_active:
+                    voice.reset()
+
+        # Apply stereo width
+        if stereo_width != 1.0:
+            L = out[:, 0].copy()
+            R = out[:, 1].copy()
+            M = (L + R) * 0.5
+            out[:, 0] = M + stereo_width * (L - M)
+            out[:, 1] = M + stereo_width * (R - M)
+
+        # Soft clip to prevent harsh clipping
+        np.clip(out, -1.0, 1.0, out=out)
+
+    def _get_voice_key(self, voice: LiveVoice) -> str:
+        """Get profile voice key for panning lookup."""
+        profile = PROFILES.get(self.profile_name, PROFILES["Neutral"])
+        chip = profile.get("chip")
+        if chip:
+            voice_keys = _flatten_voice_spec(chip["voices"])
+            return voice_keys[voice.channel % len(voice_keys)]
+        return voice.channel % 6
+
+    def _generate_voice_buffer(self, voice: LiveVoice, frames: int,
+                                vib_phase: float) -> tuple[np.ndarray, float, float]:
+        """Generate waveform buffer for a voice."""
+        wave = voice.wave_kind
+        freq = voice.freq
+        phase = voice.phase
+        duty = voice.duty
+        pitch_bend = voice.pitch_bend
+        vib_depth = voice.vibrato_depth
+
+        if wave == "pulse":
+            samples, new_phase, new_vib_phase = _rt_generate_pulse_buffer(
+                phase, freq, duty, frames, pitch_bend, vib_depth, 5.0, vib_phase
+            )
+        elif wave == "triangle":
+            samples, new_phase = _rt_generate_triangle_buffer(phase, freq, frames, pitch_bend)
+            new_vib_phase = vib_phase
+        elif wave == "square":
+            samples, new_phase = _rt_generate_square_buffer(phase, freq, frames, pitch_bend)
+            new_vib_phase = vib_phase
+        elif wave == "saw":
+            samples, new_phase = _rt_generate_saw_buffer(phase, freq, frames, pitch_bend)
+            new_vib_phase = vib_phase
+        else:
+            # Default to pulse
+            samples, new_phase, new_vib_phase = _rt_generate_pulse_buffer(
+                phase, freq, 0.5, frames, pitch_bend, vib_depth, 5.0, vib_phase
+            )
+
+        return samples, new_phase, new_vib_phase
+
+    def _apply_envelope(self, voice: LiveVoice, frames: int) -> tuple[np.ndarray, int, int, float, bool]:
+        """Apply ADSR envelope to voice. Returns (env_samples, new_phase, new_pos, new_level, still_active)."""
+        env = np.empty(frames, dtype=np.float32)
+        phase = voice.env_phase
+        pos = voice.env_pos
+        level = voice.env_level
+
+        for i in range(frames):
+            if phase == 0:  # Attack
+                level = pos / max(1, self.ATTACK_SAMPLES)
+                pos += 1
+                if pos >= self.ATTACK_SAMPLES:
+                    phase = 1
+                    pos = 0
+            elif phase == 1:  # Decay
+                level = 1.0 - (1.0 - self.SUSTAIN_LEVEL) * (pos / max(1, self.DECAY_SAMPLES))
+                pos += 1
+                if pos >= self.DECAY_SAMPLES:
+                    phase = 2
+                    pos = 0
+                    level = self.SUSTAIN_LEVEL
+            elif phase == 2:  # Sustain
+                level = self.SUSTAIN_LEVEL
+            elif phase == 3:  # Release
+                start_level = voice.env_level if pos == 0 else level
+                level = start_level * (1.0 - pos / max(1, self.RELEASE_SAMPLES))
+                pos += 1
+                if pos >= self.RELEASE_SAMPLES or level <= 0.001:
+                    phase = 4
+                    level = 0.0
+            else:  # Off
+                level = 0.0
+
+            env[i] = level
+
+        still_active = phase < 4
+        return env, phase, pos, level, still_active
+
+    def get_active_voice_count(self) -> int:
+        """Get number of currently active voices."""
+        with self.lock:
+            return sum(1 for v in self.voices if v.active)
+
+    def panic(self):
+        """All notes off - emergency stop all voices."""
+        with self.lock:
+            for v in self.voices:
+                v.reset()
+            # Reset all controller states
+            for ch in range(16):
+                self._channel_pitch_bend[ch] = 0.0
+                self._channel_mod_wheel[ch] = 0.0
+                self._channel_sustain[ch] = False
+        self._notify_status()
+
+
 # --------------------- wx GUI ---------------------
 ID_OPEN = wx.NewIdRef()
 ID_EXPORT = wx.NewIdRef()
@@ -836,6 +1407,11 @@ ID_PROF_NES = wx.NewIdRef()
 ID_PROF_GB = wx.NewIdRef()
 ID_PROF_C64 = wx.NewIdRef()
 ID_PROF_BEEPER = wx.NewIdRef()
+
+# Live MIDI IDs
+ID_LIVE_TOGGLE = wx.NewIdRef()
+ID_LIVE_REFRESH = wx.NewIdRef()
+ID_LIVE_PANIC = wx.NewIdRef()
 
 PROFILE_ID_MAP = {
     ID_PROF_NEUTRAL: "Neutral",
@@ -876,6 +1452,10 @@ class MainFrame(wx.Frame):
         self.used_channels = []
 
         self._scrubbing = False
+
+        # Live MIDI player
+        self.live_midi_player: LiveMidiPlayer | None = None
+        self._live_midi_enabled = False
 
         self._rerender_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_rerender_timer, self._rerender_timer)
@@ -922,6 +1502,16 @@ class MainFrame(wx.Frame):
         prof_menu.Check(ID_PROF_NEUTRAL, True)
         menubar.Append(prof_menu, "&Profile")
 
+        # Live MIDI menu
+        self.live_menu = wx.Menu()
+        self.live_menu.AppendCheckItem(ID_LIVE_TOGGLE, "&Enable Live MIDI\tCtrl+M")
+        self.live_menu.Append(ID_LIVE_REFRESH, "&Refresh MIDI Devices")
+        self.live_menu.Append(ID_LIVE_PANIC, "&Panic (All Notes Off)")
+        self.live_menu.AppendSeparator()
+        # Device submenu will be populated dynamically
+        self._midi_device_ids = []
+        menubar.Append(self.live_menu, "&Live MIDI")
+
         self.SetMenuBar(menubar)
 
         # IMPORTANT: no Space accelerator. Space stays normal for focused controls.
@@ -938,6 +1528,7 @@ class MainFrame(wx.Frame):
             (wx.ACCEL_CTRL, ord('3'), ID_PROF_GB),
             (wx.ACCEL_CTRL, ord('4'), ID_PROF_C64),
             (wx.ACCEL_CTRL, ord('5'), ID_PROF_BEEPER),
+            (wx.ACCEL_CTRL, ord('M'), ID_LIVE_TOGGLE),
         ])
         self.SetAcceleratorTable(accel)
 
@@ -955,6 +1546,14 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_select_profile, id=ID_PROF_GB)
         self.Bind(wx.EVT_MENU, self.on_select_profile, id=ID_PROF_C64)
         self.Bind(wx.EVT_MENU, self.on_select_profile, id=ID_PROF_BEEPER)
+
+        # Live MIDI bindings
+        self.Bind(wx.EVT_MENU, self.on_live_toggle, id=ID_LIVE_TOGGLE)
+        self.Bind(wx.EVT_MENU, self.on_live_refresh_devices, id=ID_LIVE_REFRESH)
+        self.Bind(wx.EVT_MENU, self.on_live_panic, id=ID_LIVE_PANIC)
+
+        # Populate MIDI devices on startup
+        wx.CallAfter(self._populate_midi_devices)
 
     def _build_body(self):
         panel = wx.Panel(self)
@@ -1048,6 +1647,48 @@ class MainFrame(wx.Frame):
         self.scroll.SetSizer(self.scroll_sizer)
         self.channel_sizer.Add(self.scroll, 1, wx.EXPAND | wx.ALL, 6)
 
+        # --- Live MIDI Keyboard section ---
+        live_box = wx.StaticBoxSizer(wx.StaticBox(panel, label="Live MIDI Keyboard"), wx.VERTICAL)
+
+        # Device row
+        device_row = wx.BoxSizer(wx.HORIZONTAL)
+        device_lbl = wx.StaticText(panel, label="Device:")
+        self.cmb_midi_device = wx.Choice(panel, choices=["(No MIDI devices)"])
+        self.btn_refresh_midi = wx.Button(panel, label="Refresh")
+        _a11y(self.cmb_midi_device, "MIDI input device selector", "Select MIDI keyboard or controller for live playing")
+        _a11y(self.btn_refresh_midi, "Refresh MIDI devices button")
+
+        device_row.Add(device_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        device_row.Add(self.cmb_midi_device, 1, wx.EXPAND | wx.RIGHT, 8)
+        device_row.Add(self.btn_refresh_midi, 0)
+
+        # Enable checkbox
+        self.chk_live_enable = wx.CheckBox(panel, label="Enable Live Input")
+        _a11y(self.chk_live_enable, "Enable live MIDI input checkbox",
+              "When checked, incoming MIDI notes will play through the chiptune synthesizer")
+
+        # Live volume row
+        live_vol_row = wx.BoxSizer(wx.HORIZONTAL)
+        live_vol_lbl = wx.StaticText(panel, label="Live Volume:")
+        self.slider_live_volume = wx.Slider(panel, value=80, minValue=0, maxValue=200,
+                                             style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS)
+        self.slider_live_volume.SetTickFreq(10)
+        self.lbl_live_volume = wx.StaticText(panel, label="80%")
+        _a11y(self.slider_live_volume, "Live MIDI volume slider", "Volume for live MIDI keyboard input, 0 to 200 percent")
+
+        live_vol_row.Add(live_vol_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        live_vol_row.Add(self.slider_live_volume, 1, wx.EXPAND | wx.RIGHT, 8)
+        live_vol_row.Add(self.lbl_live_volume, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        # Status label
+        self.lbl_live_status = wx.StaticText(panel, label="Status: Not connected")
+        _a11y(self.lbl_live_status, "Live MIDI status label")
+
+        live_box.Add(device_row, 0, wx.EXPAND | wx.ALL, 6)
+        live_box.Add(self.chk_live_enable, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        live_box.Add(live_vol_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        live_box.Add(self.lbl_live_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
         # Layout
         root.Add(self.lbl_file, 0, wx.ALL, 10)
         root.Add(self.lbl_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -1056,6 +1697,7 @@ class MainFrame(wx.Frame):
         root.Add(sliders, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(seek_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.lbl_profile, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        root.Add(live_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.channel_sizer, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         panel.SetSizer(root)
@@ -1073,6 +1715,12 @@ class MainFrame(wx.Frame):
         self.slider_seek.Bind(wx.EVT_SCROLL_THUMBTRACK, self.on_seek_track)
         self.slider_seek.Bind(wx.EVT_SCROLL_THUMBRELEASE, self.on_seek_release)
         self.slider_seek.Bind(wx.EVT_SLIDER, self.on_seek_release)  # fallback
+
+        # Live MIDI events
+        self.cmb_midi_device.Bind(wx.EVT_CHOICE, self.on_midi_device_change)
+        self.btn_refresh_midi.Bind(wx.EVT_BUTTON, self.on_live_refresh_devices)
+        self.chk_live_enable.Bind(wx.EVT_CHECKBOX, self.on_live_enable_toggle)
+        self.slider_live_volume.Bind(wx.EVT_SLIDER, self.on_live_volume_change)
 
         # Tooltips (optional)
         self.slider_speed.SetToolTip("Turntable speed: changes pitch and tempo like vinyl (50%..200%)")
@@ -1500,6 +2148,11 @@ class MainFrame(wx.Frame):
 
         self.profile_name = new_name
         self.lbl_profile.SetLabel(f"Profile: {self.profile_name}")
+
+        # Update live MIDI player profile
+        if self.live_midi_player:
+            self.live_midi_player.set_profile(new_name)
+
         self.set_status(f"Rendering with profile '{self.profile_name}'...")
         self.stop_player(reset_position=False)
         self._set_play_toggle_ui(False)
@@ -1546,7 +2199,188 @@ class MainFrame(wx.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # ---------- Live MIDI Methods ----------
+    def _populate_midi_devices(self):
+        """Populate the MIDI device dropdown."""
+        self.cmb_midi_device.Clear()
+
+        # Create temporary player just to list devices
+        temp_player = LiveMidiPlayer()
+        devices = temp_player.list_midi_inputs()
+
+        if devices:
+            for dev in devices:
+                self.cmb_midi_device.Append(dev)
+            self.cmb_midi_device.SetSelection(0)
+        else:
+            self.cmb_midi_device.Append("(No MIDI devices found)")
+            self.cmb_midi_device.SetSelection(0)
+
+        self._update_live_menu_devices(devices)
+
+    def _update_live_menu_devices(self, devices: list[str]):
+        """Update the Live MIDI menu with device list."""
+        # Remove old device menu items
+        for item_id in self._midi_device_ids:
+            try:
+                self.Unbind(wx.EVT_MENU, id=item_id)
+                item = self.live_menu.FindItemById(item_id)
+                if item:
+                    self.live_menu.Remove(item_id)
+            except Exception:
+                pass
+        self._midi_device_ids.clear()
+
+        # Add new device menu items
+        if devices:
+            for i, dev in enumerate(devices):
+                item_id = wx.NewIdRef()
+                self._midi_device_ids.append(item_id)
+                self.live_menu.AppendRadioItem(item_id, dev)
+                self.Bind(wx.EVT_MENU, lambda e, d=dev: self._select_midi_device(d), id=item_id)
+                if i == 0:
+                    self.live_menu.Check(item_id, True)
+
+    def _select_midi_device(self, device_name: str):
+        """Select MIDI device from menu."""
+        # Update dropdown to match
+        idx = self.cmb_midi_device.FindString(device_name)
+        if idx != wx.NOT_FOUND:
+            self.cmb_midi_device.SetSelection(idx)
+
+        # If live is enabled, reconnect to new device
+        if self._live_midi_enabled and self.live_midi_player:
+            self.live_midi_player.close_midi_input()
+            if self.live_midi_player.open_midi_input(device_name):
+                self.lbl_live_status.SetLabel(f"Status: Connected to {device_name}")
+            else:
+                self.lbl_live_status.SetLabel(f"Status: Failed to connect to {device_name}")
+
+    def on_midi_device_change(self, event=None):
+        """Handle MIDI device dropdown change."""
+        sel = self.cmb_midi_device.GetSelection()
+        if sel == wx.NOT_FOUND:
+            return
+
+        device_name = self.cmb_midi_device.GetString(sel)
+        if device_name.startswith("("):
+            return  # Placeholder text
+
+        # Update menu radio items to match
+        for i, item_id in enumerate(self._midi_device_ids):
+            if i < self.cmb_midi_device.GetCount():
+                dev = self.cmb_midi_device.GetString(i)
+                if dev == device_name:
+                    self.live_menu.Check(item_id, True)
+                    break
+
+        # If live is enabled, reconnect
+        if self._live_midi_enabled and self.live_midi_player:
+            self.live_midi_player.close_midi_input()
+            if self.live_midi_player.open_midi_input(device_name):
+                self.lbl_live_status.SetLabel(f"Status: Connected to {device_name}")
+            else:
+                self.lbl_live_status.SetLabel(f"Status: Failed to connect to {device_name}")
+
+    def on_live_refresh_devices(self, event=None):
+        """Refresh MIDI device list."""
+        self._populate_midi_devices()
+        self.set_status("MIDI devices refreshed.")
+
+    def on_live_toggle(self, event=None):
+        """Toggle live MIDI from menu."""
+        # Sync checkbox with menu
+        menu_item = self.live_menu.FindItemById(ID_LIVE_TOGGLE)
+        if menu_item:
+            is_checked = menu_item.IsChecked()
+            self.chk_live_enable.SetValue(is_checked)
+            self._toggle_live_midi(is_checked)
+
+    def on_live_enable_toggle(self, event=None):
+        """Handle live enable checkbox toggle."""
+        is_checked = self.chk_live_enable.GetValue()
+        # Sync menu with checkbox
+        self.live_menu.Check(ID_LIVE_TOGGLE, is_checked)
+        self._toggle_live_midi(is_checked)
+
+    def _toggle_live_midi(self, enable: bool):
+        """Enable or disable live MIDI playback."""
+        if enable:
+            # Create and start live MIDI player
+            if self.live_midi_player is None:
+                self.live_midi_player = LiveMidiPlayer(num_voices=12, profile_name=self.profile_name)
+                self.live_midi_player.set_status_callback(self._on_live_voice_status)
+
+            # Set volume
+            vol = self.slider_live_volume.GetValue() / 100.0
+            self.live_midi_player.set_volume(vol)
+
+            # Get selected device
+            sel = self.cmb_midi_device.GetSelection()
+            device_name = None
+            if sel != wx.NOT_FOUND:
+                device_name = self.cmb_midi_device.GetString(sel)
+                if device_name.startswith("("):
+                    device_name = None
+
+            # Start audio stream
+            if not self.live_midi_player.start():
+                self.lbl_live_status.SetLabel("Status: Audio stream error")
+                self.chk_live_enable.SetValue(False)
+                self.live_menu.Check(ID_LIVE_TOGGLE, False)
+                self._live_midi_enabled = False
+                return
+
+            # Open MIDI input
+            if device_name:
+                if self.live_midi_player.open_midi_input(device_name):
+                    self.lbl_live_status.SetLabel(f"Status: Connected to {device_name}")
+                else:
+                    self.lbl_live_status.SetLabel(f"Status: Failed to connect to {device_name}")
+            else:
+                # Try default device
+                if self.live_midi_player.open_midi_input():
+                    port = self.live_midi_player.get_midi_port_name() or "default"
+                    self.lbl_live_status.SetLabel(f"Status: Connected to {port}")
+                else:
+                    self.lbl_live_status.SetLabel("Status: No MIDI device available")
+
+            self._live_midi_enabled = True
+            self.set_status("Live MIDI enabled.")
+        else:
+            # Stop live MIDI player
+            if self.live_midi_player:
+                self.live_midi_player.close_midi_input()
+                self.live_midi_player.stop()
+
+            self._live_midi_enabled = False
+            self.lbl_live_status.SetLabel("Status: Not connected")
+            self.set_status("Live MIDI disabled.")
+
+    def _on_live_voice_status(self, active_count: int):
+        """Callback for live voice status updates."""
+        if self._live_midi_enabled:
+            device = self.live_midi_player.get_midi_port_name() if self.live_midi_player else "unknown"
+            self.lbl_live_status.SetLabel(f"Status: {device} - {active_count} voice{'s' if active_count != 1 else ''} active")
+
+    def on_live_volume_change(self, event=None):
+        """Handle live volume slider change."""
+        vol = self.slider_live_volume.GetValue()
+        self.lbl_live_volume.SetLabel(f"{vol}%")
+        if self.live_midi_player:
+            self.live_midi_player.set_volume(vol / 100.0)
+
+    def on_live_panic(self, event=None):
+        """All notes off - panic button."""
+        if self.live_midi_player:
+            self.live_midi_player.panic()
+            self.set_status("Live MIDI: All notes off.")
+
     def on_exit(self, event=None):
+        # Stop live MIDI player
+        if self.live_midi_player:
+            self.live_midi_player.close_midi_input()
+            self.live_midi_player.stop()
         self.stop_player(reset_position=False)
         self.Close()
 
