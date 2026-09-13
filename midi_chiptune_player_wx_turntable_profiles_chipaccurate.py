@@ -1625,8 +1625,9 @@ class MainFrame(wx.Frame):
 
         # --- Seek row ---
         seek_box = wx.StaticBoxSizer(wx.StaticBox(panel, label="Position"), wx.VERTICAL)
-        self.slider_seek = wx.Slider(panel, value=0, minValue=0, maxValue=1000, style=wx.SL_HORIZONTAL)
-        self.lbl_time = wx.StaticText(panel, label="Time: 0:00 / 0:00")
+        seek_parent = seek_box.GetStaticBox()
+        self.slider_seek = wx.Slider(seek_parent, value=0, minValue=0, maxValue=1000, style=wx.SL_HORIZONTAL)
+        self.lbl_time = wx.StaticText(seek_parent, label="Time: 0:00 / 0:00")
         _a11y(self.slider_seek, "Playback position slider", "Scrub playback position. 0 to 1000.")
         _a11y(self.lbl_time, "Time label")
 
@@ -1641,7 +1642,7 @@ class MainFrame(wx.Frame):
         self.channel_box = wx.StaticBox(panel, label="Per used MIDI channel volume (auto re-render)")
         self.channel_sizer = wx.StaticBoxSizer(self.channel_box, wx.VERTICAL)
 
-        self.scroll = wx.ScrolledWindow(panel, style=wx.VSCROLL)
+        self.scroll = wx.ScrolledWindow(self.channel_box, style=wx.VSCROLL)
         self.scroll.SetScrollRate(10, 10)
         self.scroll_sizer = wx.BoxSizer(wx.VERTICAL)
         self.scroll.SetSizer(self.scroll_sizer)
@@ -1649,12 +1650,13 @@ class MainFrame(wx.Frame):
 
         # --- Live MIDI Keyboard section ---
         live_box = wx.StaticBoxSizer(wx.StaticBox(panel, label="Live MIDI Keyboard"), wx.VERTICAL)
+        live_parent = live_box.GetStaticBox()
 
         # Device row
         device_row = wx.BoxSizer(wx.HORIZONTAL)
-        device_lbl = wx.StaticText(panel, label="Device:")
-        self.cmb_midi_device = wx.Choice(panel, choices=["(No MIDI devices)"])
-        self.btn_refresh_midi = wx.Button(panel, label="Refresh")
+        device_lbl = wx.StaticText(live_parent, label="Device:")
+        self.cmb_midi_device = wx.Choice(live_parent, choices=["(No MIDI devices)"])
+        self.btn_refresh_midi = wx.Button(live_parent, label="Refresh")
         _a11y(self.cmb_midi_device, "MIDI input device selector", "Select MIDI keyboard or controller for live playing")
         _a11y(self.btn_refresh_midi, "Refresh MIDI devices button")
 
@@ -1663,17 +1665,17 @@ class MainFrame(wx.Frame):
         device_row.Add(self.btn_refresh_midi, 0)
 
         # Enable checkbox
-        self.chk_live_enable = wx.CheckBox(panel, label="Enable Live Input")
+        self.chk_live_enable = wx.CheckBox(live_parent, label="Enable Live Input")
         _a11y(self.chk_live_enable, "Enable live MIDI input checkbox",
               "When checked, incoming MIDI notes will play through the chiptune synthesizer")
 
         # Live volume row
         live_vol_row = wx.BoxSizer(wx.HORIZONTAL)
-        live_vol_lbl = wx.StaticText(panel, label="Live Volume:")
-        self.slider_live_volume = wx.Slider(panel, value=80, minValue=0, maxValue=200,
+        live_vol_lbl = wx.StaticText(live_parent, label="Live Volume:")
+        self.slider_live_volume = wx.Slider(live_parent, value=80, minValue=0, maxValue=200,
                                              style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS)
         self.slider_live_volume.SetTickFreq(10)
-        self.lbl_live_volume = wx.StaticText(panel, label="80%")
+        self.lbl_live_volume = wx.StaticText(live_parent, label="80%")
         _a11y(self.slider_live_volume, "Live MIDI volume slider", "Volume for live MIDI keyboard input, 0 to 200 percent")
 
         live_vol_row.Add(live_vol_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
@@ -1681,7 +1683,7 @@ class MainFrame(wx.Frame):
         live_vol_row.Add(self.lbl_live_volume, 0, wx.ALIGN_CENTER_VERTICAL)
 
         # Status label
-        self.lbl_live_status = wx.StaticText(panel, label="Status: Not connected")
+        self.lbl_live_status = wx.StaticText(live_parent, label="Status: Not connected")
         _a11y(self.lbl_live_status, "Live MIDI status label")
 
         live_box.Add(device_row, 0, wx.EXPAND | wx.ALL, 6)
