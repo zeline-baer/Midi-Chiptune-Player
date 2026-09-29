@@ -1392,6 +1392,129 @@ class LiveMidiPlayer:
         self._notify_status()
 
 
+# --------------------- Metronome ---------------------
+class Metronome:
+    """Standalone metronome with accent on beat 1, driven by a sounddevice callback."""
+
+    _CLICK_SAMPLES = max(2, int(SAMPLE_RATE * 0.005))  # 5 ms click
+
+    def __init__(self):
+        self.bpm: float = 120.0
+        self.beats_per_bar: int = 4
+        self.volume: float = 0.7
+        self._active = False
+        self._stream: sd.OutputStream | None = None
+        self._lock = threading.Lock()
+        # Callback-internal state (only touched from the audio thread or before start())
+        self._beat_pos: int = 0
+        self._beat_num: int = 0
+        self._pending_click: np.ndarray | None = None
+        self._pending_off: int = 0
+        self._rebuild_clicks()
+
+    def _rebuild_clicks(self):
+        n = self._CLICK_SAMPLES
+        t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
+        decay = np.exp(-t / 0.002).astype(np.float32)
+        v = float(self.volume) * MASTER_GAIN
+        # Accent (beat 1): 1200 Hz square burst
+        self._accent = (np.sign(np.sin(_TWO_PI * 1200.0 * t)) * decay * v).astype(np.float32)
+        # Normal beat: 800 Hz, quieter
+        self._beat_click = (np.sign(np.sin(_TWO_PI * 800.0 * t)) * decay * v * 0.65).astype(np.float32)
+
+    def set_bpm(self, bpm: float):
+        with self._lock:
+            self.bpm = max(20.0, min(300.0, float(bpm)))
+
+    def set_beats_per_bar(self, n: int):
+        with self._lock:
+            self.beats_per_bar = max(1, int(n))
+
+    def set_volume(self, vol: float):
+        with self._lock:
+            self.volume = max(0.0, min(2.0, float(vol)))
+            self._rebuild_clicks()
+
+    def start(self) -> bool:
+        if self._active:
+            return True
+        self._beat_pos = 0
+        self._beat_num = 0
+        self._pending_click = None
+        self._pending_off = 0
+        try:
+            self._stream = sd.OutputStream(
+                channels=2, dtype='float32', samplerate=SAMPLE_RATE,
+                blocksize=256, latency='low', callback=self._callback,
+            )
+            self._stream.start()
+            self._active = True
+            return True
+        except Exception:
+            return False
+
+    def stop(self):
+        self._active = False
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def _callback(self, outdata, frames, time_info, status):
+        out = outdata.view(np.float32).reshape(-1, 2)
+        out.fill(0.0)
+
+        with self._lock:
+            beat_len = max(1, int(SAMPLE_RATE * 60.0 / self.bpm))
+            bpb = self.beats_per_bar
+            accent = self._accent
+            beat_click = self._beat_click
+
+        beat_pos = self._beat_pos
+        beat_num = self._beat_num
+
+        # Finish any click that started in the previous callback
+        if self._pending_click is not None:
+            rem = len(self._pending_click) - self._pending_off
+            n = min(rem, frames)
+            chunk = self._pending_click[self._pending_off:self._pending_off + n]
+            out[:n, 0] += chunk
+            out[:n, 1] += chunk
+            self._pending_off += n
+            if self._pending_off >= len(self._pending_click):
+                self._pending_click = None
+                self._pending_off = 0
+
+        # Walk through the frame and fire a click whenever a beat boundary is reached
+        i = 0
+        while i < frames:
+            if beat_pos == 0:
+                click = accent if beat_num % bpb == 0 else beat_click
+                fit = min(len(click), frames - i)
+                out[i:i + fit, 0] += click[:fit]
+                out[i:i + fit, 1] += click[:fit]
+                leftover = len(click) - fit
+                if leftover > 0:
+                    self._pending_click = click
+                    self._pending_off = fit
+
+            step = min(beat_len - beat_pos, frames - i)
+            beat_pos += step
+            i += step
+            if beat_pos >= beat_len:
+                beat_pos = 0
+                beat_num += 1
+
+        self._beat_pos = beat_pos
+        self._beat_num = beat_num
+
+
 # --------------------- wx GUI ---------------------
 ID_OPEN = wx.NewIdRef()
 ID_EXPORT = wx.NewIdRef()
@@ -1412,6 +1535,9 @@ ID_PROF_BEEPER = wx.NewIdRef()
 ID_LIVE_TOGGLE = wx.NewIdRef()
 ID_LIVE_REFRESH = wx.NewIdRef()
 ID_LIVE_PANIC = wx.NewIdRef()
+
+# Metronome IDs
+ID_METRO_TOGGLE = wx.NewIdRef()
 
 PROFILE_ID_MAP = {
     ID_PROF_NEUTRAL: "Neutral",
@@ -1457,6 +1583,10 @@ class MainFrame(wx.Frame):
         self.live_midi_player: LiveMidiPlayer | None = None
         self._live_midi_enabled = False
 
+        # Metronome
+        self._metronome = Metronome()
+        self._tap_times: list[float] = []
+
         self._rerender_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_rerender_timer, self._rerender_timer)
         self._rerender_pending = False
@@ -1485,6 +1615,8 @@ class MainFrame(wx.Frame):
         play_menu.Append(ID_STOP, "&Stop")
         play_menu.AppendCheckItem(ID_LOOP, "&Loop\tCtrl+L")
         play_menu.Check(ID_LOOP, True)
+        play_menu.AppendSeparator()
+        play_menu.AppendCheckItem(ID_METRO_TOGGLE, "&Metronome\tCtrl+T")
         menubar.Append(play_menu, "&Playback")
 
         speed_menu = wx.Menu()
@@ -1529,6 +1661,7 @@ class MainFrame(wx.Frame):
             (wx.ACCEL_CTRL, ord('4'), ID_PROF_C64),
             (wx.ACCEL_CTRL, ord('5'), ID_PROF_BEEPER),
             (wx.ACCEL_CTRL, ord('M'), ID_LIVE_TOGGLE),
+            (wx.ACCEL_CTRL, ord('T'), ID_METRO_TOGGLE),
         ])
         self.SetAcceleratorTable(accel)
 
@@ -1551,6 +1684,9 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_live_toggle, id=ID_LIVE_TOGGLE)
         self.Bind(wx.EVT_MENU, self.on_live_refresh_devices, id=ID_LIVE_REFRESH)
         self.Bind(wx.EVT_MENU, self.on_live_panic, id=ID_LIVE_PANIC)
+
+        # Metronome bindings
+        self.Bind(wx.EVT_MENU, self.on_metro_toggle, id=ID_METRO_TOGGLE)
 
         # Populate MIDI devices on startup
         wx.CallAfter(self._populate_midi_devices)
@@ -1691,6 +1827,57 @@ class MainFrame(wx.Frame):
         live_box.Add(live_vol_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         live_box.Add(self.lbl_live_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
+        # --- Metronome section ---
+        metro_box = wx.StaticBoxSizer(wx.StaticBox(panel, label="Metronome"), wx.VERTICAL)
+        metro_parent = metro_box.GetStaticBox()
+
+        # Row 1: enable + tap tempo
+        metro_row1 = wx.BoxSizer(wx.HORIZONTAL)
+        self.chk_metro = wx.CheckBox(metro_parent, label="Enable")
+        self.btn_tap = wx.Button(metro_parent, label="Tap Tempo")
+        _a11y(self.chk_metro, "Metronome enable checkbox", "Start or stop the metronome click track")
+        _a11y(self.btn_tap, "Tap tempo button", "Click several times in rhythm to set the BPM")
+        metro_row1.Add(self.chk_metro, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 16)
+        metro_row1.Add(self.btn_tap, 0)
+
+        # Row 2: BPM slider
+        metro_bpm_row = wx.BoxSizer(wx.HORIZONTAL)
+        metro_bpm_lbl = wx.StaticText(metro_parent, label="BPM:")
+        self.slider_metro_bpm = wx.Slider(metro_parent, value=120, minValue=20, maxValue=300,
+                                           style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS)
+        self.slider_metro_bpm.SetTickFreq(20)
+        self.lbl_metro_bpm = wx.StaticText(metro_parent, label="120 BPM")
+        _a11y(self.slider_metro_bpm, "Metronome BPM slider", "Beats per minute, 20 to 300")
+        metro_bpm_row.Add(metro_bpm_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        metro_bpm_row.Add(self.slider_metro_bpm, 1, wx.EXPAND | wx.RIGHT, 8)
+        metro_bpm_row.Add(self.lbl_metro_bpm, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        # Row 3: beats per bar
+        metro_bar_row = wx.BoxSizer(wx.HORIZONTAL)
+        metro_bar_lbl = wx.StaticText(metro_parent, label="Beats/bar:")
+        self.cmb_metro_beats = wx.Choice(metro_parent, choices=["2", "3", "4", "6"])
+        self.cmb_metro_beats.SetSelection(2)  # default: 4/4
+        _a11y(self.cmb_metro_beats, "Beats per bar selector", "Number of beats in one bar (time signature numerator)")
+        metro_bar_row.Add(metro_bar_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        metro_bar_row.Add(self.cmb_metro_beats, 0)
+
+        # Row 4: volume
+        metro_vol_row = wx.BoxSizer(wx.HORIZONTAL)
+        metro_vol_lbl = wx.StaticText(metro_parent, label="Volume:")
+        self.slider_metro_vol = wx.Slider(metro_parent, value=70, minValue=0, maxValue=100,
+                                           style=wx.SL_HORIZONTAL | wx.SL_AUTOTICKS)
+        self.slider_metro_vol.SetTickFreq(10)
+        self.lbl_metro_vol = wx.StaticText(metro_parent, label="70%")
+        _a11y(self.slider_metro_vol, "Metronome volume slider", "Click volume 0 to 100 percent")
+        metro_vol_row.Add(metro_vol_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        metro_vol_row.Add(self.slider_metro_vol, 1, wx.EXPAND | wx.RIGHT, 8)
+        metro_vol_row.Add(self.lbl_metro_vol, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        metro_box.Add(metro_row1, 0, wx.ALL, 6)
+        metro_box.Add(metro_bpm_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        metro_box.Add(metro_bar_row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        metro_box.Add(metro_vol_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
         # Layout
         root.Add(self.lbl_file, 0, wx.ALL, 10)
         root.Add(self.lbl_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -1700,6 +1887,7 @@ class MainFrame(wx.Frame):
         root.Add(seek_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.lbl_profile, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(live_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        root.Add(metro_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.channel_sizer, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         panel.SetSizer(root)
@@ -1723,6 +1911,13 @@ class MainFrame(wx.Frame):
         self.btn_refresh_midi.Bind(wx.EVT_BUTTON, self.on_live_refresh_devices)
         self.chk_live_enable.Bind(wx.EVT_CHECKBOX, self.on_live_enable_toggle)
         self.slider_live_volume.Bind(wx.EVT_SLIDER, self.on_live_volume_change)
+
+        # Metronome events
+        self.chk_metro.Bind(wx.EVT_CHECKBOX, self.on_metro_toggle)
+        self.btn_tap.Bind(wx.EVT_BUTTON, self.on_metro_tap)
+        self.slider_metro_bpm.Bind(wx.EVT_SLIDER, self.on_metro_bpm_change)
+        self.cmb_metro_beats.Bind(wx.EVT_CHOICE, self.on_metro_beats_change)
+        self.slider_metro_vol.Bind(wx.EVT_SLIDER, self.on_metro_vol_change)
 
         # Tooltips (optional)
         self.slider_speed.SetToolTip("Turntable speed: changes pitch and tempo like vinyl (50%..200%)")
@@ -2378,11 +2573,70 @@ class MainFrame(wx.Frame):
             self.live_midi_player.panic()
             self.set_status("Live MIDI: All notes off.")
 
+    # ---------- Metronome handlers ----------
+    def on_metro_toggle(self, event=None):
+        """Toggle metronome on/off — called from checkbox or menu item."""
+        # Determine desired state from whichever control was triggered
+        if isinstance(event, wx.CommandEvent) and event.GetId() == ID_METRO_TOGGLE:
+            # Triggered from menu: sync checkbox
+            checked = self.GetMenuBar().FindItemById(ID_METRO_TOGGLE).IsChecked()
+            self.chk_metro.SetValue(checked)
+        else:
+            # Triggered from checkbox: sync menu
+            checked = self.chk_metro.GetValue()
+            mb = self.GetMenuBar()
+            if mb:
+                mb.FindItemById(ID_METRO_TOGGLE).Check(checked)
+
+        if checked:
+            if not self._metronome.start():
+                self.set_status("Metronome: could not open audio stream.")
+                self.chk_metro.SetValue(False)
+                mb = self.GetMenuBar()
+                if mb:
+                    mb.FindItemById(ID_METRO_TOGGLE).Check(False)
+        else:
+            self._metronome.stop()
+
+    def on_metro_bpm_change(self, event=None):
+        bpm = self.slider_metro_bpm.GetValue()
+        self.lbl_metro_bpm.SetLabel(f"{bpm} BPM")
+        self._metronome.set_bpm(float(bpm))
+        self._tap_times.clear()
+
+    def on_metro_beats_change(self, event=None):
+        sel = self.cmb_metro_beats.GetStringSelection()
+        try:
+            self._metronome.set_beats_per_bar(int(sel))
+        except ValueError:
+            pass
+
+    def on_metro_vol_change(self, event=None):
+        vol = self.slider_metro_vol.GetValue()
+        self.lbl_metro_vol.SetLabel(f"{vol}%")
+        self._metronome.set_volume(vol / 100.0)
+
+    def on_metro_tap(self, event=None):
+        """Record a tap and recalculate BPM from the average tap interval."""
+        now = time.time()
+        self._tap_times.append(now)
+        # Discard taps older than 3 seconds (stale rhythm)
+        self._tap_times = [t for t in self._tap_times if now - t < 3.0]
+        if len(self._tap_times) >= 2:
+            intervals = [self._tap_times[i + 1] - self._tap_times[i]
+                         for i in range(len(self._tap_times) - 1)]
+            avg = sum(intervals) / len(intervals)
+            bpm = int(round(max(20.0, min(300.0, 60.0 / avg))))
+            self.slider_metro_bpm.SetValue(bpm)
+            self.lbl_metro_bpm.SetLabel(f"{bpm} BPM")
+            self._metronome.set_bpm(float(bpm))
+
     def on_exit(self, event=None):
         # Stop live MIDI player
         if self.live_midi_player:
             self.live_midi_player.close_midi_input()
             self.live_midi_player.stop()
+        self._metronome.stop()
         self.stop_player(reset_position=False)
         self.Close()
 
